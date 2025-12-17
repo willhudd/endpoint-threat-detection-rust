@@ -1,0 +1,1 @@
+C:\Users\will\OneDrive\Documents\Projects\CustomEDR\target\release\edr-cli.exe: C:\Users\will\OneDrive\Documents\Projects\CustomEDR\cli\src\main.rs C:\Users\will\OneDrive\Documents\Projects\CustomEDR\shared\src\lib.rs C:\Users\will\OneDrive\Documents\Projects\CustomEDR\shared\src\models.rs
