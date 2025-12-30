@@ -1,0 +1,25 @@
+# Rust build output
+/target/
+Cargo.lock
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# OS-specific files
+.env.local
+.env.*.local
+
+# Dependency directories
+/target/
+
+# IDE extensions
+*.iml
+.project
+.classpath
+*.sublime-workspace

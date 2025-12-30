@@ -1,0 +1,34 @@
+{
+  "suspicious_process_patterns": [
+    "(?i).*\\.(ps1|vbs|js|hta|bat|cmd)$",
+    "(?i).*(powershell|cmd|wscript|cscript|mshta).*"
+  ],
+  "suspicious_network_patterns": [
+    "(?i).*(tor|proxy|vpn).*",
+    "\\d+\\.\\d+\\.\\d+\\.\\d+:\\d{4,5}"
+  ],
+  "alert_thresholds": {
+    "max_connections_per_minute": 100,
+    "max_processes_per_minute": 50,
+    "suspicious_port_range": [49152, 65535]
+  },
+  "correlation_rules": [
+    {
+      "name": "NewProcessNetworkActivity",
+      "description": "New process making network connections within 5 seconds",
+      "severity": "Medium",
+      "conditions": [
+        {
+          "field": "process_age",
+          "operator": "<",
+          "value": "5"
+        },
+        {
+          "field": "network_connections",
+          "operator": ">",
+          "value": "0"
+        }
+      ]
+    }
+  ]
+}
