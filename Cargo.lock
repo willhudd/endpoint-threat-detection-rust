@@ -142,7 +142,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "etw_edr"
+name = "endpoint-threat-detection-rust"
 version = "0.1.0"
 dependencies = [
  "anyhow",
