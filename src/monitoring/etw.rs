@@ -22,6 +22,13 @@ use std::sync::Mutex;
 // GUID for Microsoft-Windows-TCPIP
 const TCPIP_PROVIDER_GUID: u128 = 0x7dd42a49532948328dfd43d979153a88u128;
 
+// TCP/IP Event IDs
+const EVENT_ID_TCPIP_SEND: u16 = 10;
+const EVENT_ID_TCPIP_RECV: u16 = 11;
+const EVENT_ID_TCPIP_CONNECT: u16 = 12;
+const EVENT_ID_TCPIP_DISCONNECT: u16 = 13;
+const EVENT_ID_TCPIP_RECONNECT: u16 = 16;
+
 // Global sender storage with thread-safe access
 lazy_static::lazy_static! {
     static ref GLOBAL_SENDER: Mutex<Option<Arc<Sender<BaseEvent>>>> = Mutex::new(None);
@@ -33,6 +40,27 @@ const EVENT_TRACE_FLAG_PROCESS: u32 = 0x00000001;
 const EVENT_TRACE_FLAG_NETWORK_TCPIP: u32 = 0x00000100;
 const EVENT_TRACE_FLAG_REGISTRY: u32 = 0x00000004;
 const EVENT_TRACE_FLAG_FILE_IO: u32 = 0x02000000;
+
+// TCP/IP event data structures
+#[repr(C)]
+struct TcpIpV4Event {
+    pid: u32,
+    size: u32,
+    daddr: u32,  // destination address
+    saddr: u32,  // source address
+    dport: u16,  // destination port
+    sport: u16,  // source port
+}
+
+#[repr(C)]
+struct TcpIpV6Event {
+    pid: u32,
+    size: u32,
+    daddr: [u8; 16],  // destination address
+    saddr: [u8; 16],  // source address
+    dport: u16,       // destination port
+    sport: u16,       // source port
+}
 
 pub fn start_kernel_monitor(
     tx: Sender<BaseEvent>,
@@ -48,7 +76,7 @@ pub fn start_kernel_monitor(
 
             log::info!("Attempting to start kernel ETW session...");
 
-            // First, stop any existing kernel logger session (like in working version)
+            // First, stop any existing kernel logger session
             let mut stop_buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 1024];
             let stop_props = stop_buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
             (*stop_props).Wnode.BufferSize = stop_buffer.len() as u32;
@@ -64,7 +92,7 @@ pub fn start_kernel_monitor(
                 log::info!("Stopped existing kernel logger session");
             }
 
-            // Create trace session with kernel logger (like in working version)
+            // Create trace session with kernel logger
             let mut buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 1024];
             let props = buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
 
@@ -99,7 +127,6 @@ pub fn start_kernel_monitor(
                     }
                 }
                 
-                // Try to open existing trace anyway
                 log::info!("Attempting to open existing kernel trace...");
             } else {
                 log::info!("✅ Kernel ETW session started successfully");
@@ -110,7 +137,7 @@ pub fn start_kernel_monitor(
             logfile.LoggerName = windows::core::PWSTR(KERNEL_LOGGER_NAMEW.as_ptr() as *mut u16);
             logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
 
-            // Define callback - MUST be unsafe because it dereferences raw pointers
+            // Define callback
             unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
                 if record.is_null() {
                     return;
@@ -128,7 +155,7 @@ pub fn start_kernel_monitor(
 
                 // Get process name from PID
                 let process_name = resolve_process_name(pid).unwrap_or_else(|| {
-                    // Fallback: try to extract from UserData like in working version
+                    // Fallback: try to extract from UserData
                     if rec.UserDataLength > 0 && !rec.UserData.is_null() {
                         extract_process_name_from_userdata(rec.UserData, rec.UserDataLength as usize)
                     } else {
@@ -149,13 +176,13 @@ pub fn start_kernel_monitor(
                 let event_result = match opcode {
                     1 => {
                         // Process Start
-                        log::debug!("ETW Process start PID={} name={}", pid, process_name);
+                        log::info!("ETW Process start PID={} name={}", pid, process_name);
                         let event = ProcessEvent::new_start(pid, 0, process_name.clone());
                         Some(BaseEvent::new(EventType::ProcessStart(event)))
                     }
                     2 => {
                         // Process End
-                        log::debug!("ETW Process end PID={}", pid);
+                        log::info!("ETW Process end PID={} name={}", pid, process_name);
                         let event = ProcessEvent::new_end(pid, process_name.clone(), None);
                         Some(BaseEvent::new(EventType::ProcessEnd(event)))
                     }
@@ -194,9 +221,7 @@ pub fn start_kernel_monitor(
             // Run ProcessTrace in a separate thread
             let process_trace_handle = trace_handle;
             let process_thread = std::thread::spawn(move || {
-                unsafe {
-                    let _ = ProcessTrace(&[process_trace_handle], None, None);
-                }
+                let _ = ProcessTrace(&[process_trace_handle], None, None);
             });
 
             log::info!("✅ Kernel ETW trace processing started");
@@ -324,7 +349,7 @@ pub fn start_tcpip_listener(
             logfile.LoggerName = windows::core::PWSTR(session_name.as_ptr() as *mut u16);
             logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
 
-            // TCP/IP event callback - MUST be unsafe
+            // TCP/IP event callback
             unsafe extern "system" fn tcpip_callback(record: *mut EVENT_RECORD) {
                 if record.is_null() {
                     return;
@@ -334,39 +359,88 @@ pub fn start_tcpip_listener(
                 let rec = unsafe { &*record };
                 let header = &rec.EventHeader;
                 let pid = header.ProcessId;
+                let event_id = header.EventDescriptor.Id;
 
                 if pid <= 4 || pid == 0 {
                     return;
                 }
-                
-                log::debug!("TCP/IP event received for PID: {}", pid);
 
                 let process_name = resolve_process_name(pid).unwrap_or_else(|| String::from("Unknown"));
                 if process_name.to_lowercase().contains("svchost") || 
-                process_name.to_lowercase().contains("system") ||
-                process_name.to_lowercase().contains("csrss") ||
-                process_name.to_lowercase().contains("wininit") ||
-                process_name.to_lowercase().contains("services") {
+                   process_name.to_lowercase().contains("system") ||
+                   process_name.to_lowercase().contains("csrss") ||
+                   process_name.to_lowercase().contains("wininit") ||
+                   process_name.to_lowercase().contains("services") {
                     return;
                 }
 
-                // Create a NetworkEvent
-                let net = NetworkEvent::new(
-                    pid,
-                    process_name,
-                    crate::events::network::NetworkDirection::Outbound,
-                    crate::events::network::Protocol::TCP,
-                    String::from("0.0.0.0"),
-                    0,
-                    String::from("0.0.0.0"),
-                    0,
-                );
-                
-                let base = BaseEvent::new(EventType::NetworkConnection(net));
-                
-                if let Ok(guard) = GLOBAL_SENDER.lock() {
-                    if let Some(sender) = guard.as_ref() {
-                        let _ = sender.send(base);
+                // Parse TCP/IP event data
+                if rec.UserDataLength > 0 && !rec.UserData.is_null() {
+                    let (saddr, daddr, sport, dport, is_ipv6) = match event_id {
+                        EVENT_ID_TCPIP_SEND | EVENT_ID_TCPIP_RECV | 
+                        EVENT_ID_TCPIP_CONNECT | EVENT_ID_TCPIP_DISCONNECT | 
+                        EVENT_ID_TCPIP_RECONNECT => {
+                            unsafe {
+                                parse_tcpip_event(rec.UserData, rec.UserDataLength as usize)
+                            }
+                        }
+                        _ => return, // Unknown event type
+                    };
+
+                    if saddr.is_empty() || daddr.is_empty() {
+                        return; // Failed to parse
+                    }
+
+                    // Determine if this is a local or external connection
+                    let network_type = classify_network_connection(&saddr, &daddr);
+                    
+                    // Determine direction based on event ID
+                    let direction = match event_id {
+                        EVENT_ID_TCPIP_SEND | EVENT_ID_TCPIP_CONNECT => "Outbound",
+                        EVENT_ID_TCPIP_RECV => "Inbound",
+                        EVENT_ID_TCPIP_DISCONNECT => "Disconnect",
+                        EVENT_ID_TCPIP_RECONNECT => "Reconnect",
+                        _ => "Unknown",
+                    };
+
+                    // Log the event with all details
+                    log::info!(
+                        "TCP/IP Event: PID={} Process={} Direction={} NetworkType={} Protocol={} Source={}:{} Dest={}:{}",
+                        pid,
+                        process_name,
+                        direction,
+                        network_type,
+                        if is_ipv6 { "IPv6" } else { "IPv4" },
+                        saddr,
+                        sport,
+                        daddr,
+                        dport
+                    );
+
+                    // Create NetworkEvent
+                    let net_direction = match event_id {
+                        EVENT_ID_TCPIP_SEND | EVENT_ID_TCPIP_CONNECT => 
+                            crate::events::network::NetworkDirection::Outbound,
+                        _ => crate::events::network::NetworkDirection::Inbound,
+                    };
+
+                    let net = NetworkEvent::new(
+                        pid,
+                        process_name,
+                        net_direction,
+                        crate::events::network::Protocol::TCP,
+                        saddr,
+                        sport,
+                        daddr,
+                        dport,
+                    );
+                    
+                    let base = BaseEvent::new(EventType::NetworkConnection(net));
+                    
+                    if let Ok(guard) = GLOBAL_SENDER.lock() {
+                        if let Some(sender) = guard.as_ref() {
+                            let _ = sender.send(base);
+                        }
                     }
                 }
             }
@@ -394,9 +468,7 @@ pub fn start_tcpip_listener(
             // Run ProcessTrace in a separate thread
             let process_trace_handle = trace_handle;
             let process_thread = std::thread::spawn(move || {
-                unsafe {
-                    let _ = ProcessTrace(&[process_trace_handle], None, None);
-                }
+                let _ = ProcessTrace(&[process_trace_handle], None, None);
             });
 
             // Wait for shutdown signal
@@ -433,6 +505,109 @@ pub fn start_tcpip_listener(
     Ok(handle)
 }
 
+// Parse TCP/IP event data from UserData buffer
+// Returns (source_addr, dest_addr, source_port, dest_port, is_ipv6)
+unsafe fn parse_tcpip_event(user_data: *const std::ffi::c_void, data_len: usize) -> (String, String, u16, u16, bool) {
+    // Try IPv4 first
+    if data_len >= std::mem::size_of::<TcpIpV4Event>() {
+        
+        let event = &*(user_data as *const TcpIpV4Event);
+        
+        // Convert network byte order to host byte order
+        let saddr_bytes = event.saddr.to_be_bytes();
+        let daddr_bytes = event.daddr.to_be_bytes();
+        
+        let saddr = format!("{}.{}.{}.{}", 
+            saddr_bytes[0], saddr_bytes[1], saddr_bytes[2], saddr_bytes[3]);
+        let daddr = format!("{}.{}.{}.{}", 
+            daddr_bytes[0], daddr_bytes[1], daddr_bytes[2], daddr_bytes[3]);
+        
+        let sport = u16::from_be(event.sport);
+        let dport = u16::from_be(event.dport);
+        
+        return (saddr, daddr, sport, dport, false);
+    }
+    
+    // Try IPv6
+    if data_len >= std::mem::size_of::<TcpIpV6Event>() {
+        let event = &*(user_data as *const TcpIpV6Event);
+        
+        let saddr = format_ipv6(&event.saddr);
+        let daddr = format_ipv6(&event.daddr);
+        
+        let sport = u16::from_be(event.sport);
+        let dport = u16::from_be(event.dport);
+        
+        return (saddr, daddr, sport, dport, true);
+    }
+    
+    (String::new(), String::new(), 0, 0, false)
+}
+
+// Format IPv6 address from byte array
+fn format_ipv6(bytes: &[u8; 16]) -> String {
+    format!("{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11],
+        bytes[12], bytes[13], bytes[14], bytes[15])
+}
+
+// Classify whether a connection is local or external
+fn classify_network_connection(saddr: &str, daddr: &str) -> &'static str {
+    // Check if either address is loopback
+    if saddr.starts_with("127.") || daddr.starts_with("127.") ||
+       saddr == "::1" || daddr == "::1" {
+        return "Loopback";
+    }
+    
+    // Check if both are private addresses (local network)
+    if is_private_ipv4(saddr) && is_private_ipv4(daddr) {
+        return "LocalNetwork";
+    }
+    
+    // Check if both are IPv6 link-local or unique local
+    if (is_ipv6_link_local(saddr) && is_ipv6_link_local(daddr)) ||
+       (is_ipv6_unique_local(saddr) && is_ipv6_unique_local(daddr)) {
+        return "LocalNetwork";
+    }
+    
+    // If one is private and one is public, it's likely NAT/external
+    if is_private_ipv4(saddr) || is_private_ipv4(daddr) ||
+       is_ipv6_link_local(saddr) || is_ipv6_link_local(daddr) ||
+       is_ipv6_unique_local(saddr) || is_ipv6_unique_local(daddr) {
+        return "External";
+    }
+    
+    // Both are public addresses
+    "External"
+}
+
+// Check if an IPv4 address is private
+fn is_private_ipv4(addr: &str) -> bool {
+    addr.starts_with("10.") ||
+    addr.starts_with("172.16.") || addr.starts_with("172.17.") ||
+    addr.starts_with("172.18.") || addr.starts_with("172.19.") ||
+    addr.starts_with("172.20.") || addr.starts_with("172.21.") ||
+    addr.starts_with("172.22.") || addr.starts_with("172.23.") ||
+    addr.starts_with("172.24.") || addr.starts_with("172.25.") ||
+    addr.starts_with("172.26.") || addr.starts_with("172.27.") ||
+    addr.starts_with("172.28.") || addr.starts_with("172.29.") ||
+    addr.starts_with("172.30.") || addr.starts_with("172.31.") ||
+    addr.starts_with("192.168.")
+}
+
+// Check if an IPv6 address is link-local (fe80::/10)
+fn is_ipv6_link_local(addr: &str) -> bool {
+    addr.to_lowercase().starts_with("fe80:")
+}
+
+// Check if an IPv6 address is unique local (fc00::/7)
+fn is_ipv6_unique_local(addr: &str) -> bool {
+    let lower = addr.to_lowercase();
+    lower.starts_with("fc") || lower.starts_with("fd")
+}
+
 fn resolve_process_name(pid: u32) -> Option<String> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid);
@@ -462,7 +637,7 @@ fn extract_process_name_from_userdata(user_data: *const std::ffi::c_void, data_l
         let mut found_name = String::from("Unknown");
         let mut i = 0;
         
-        // Scan for potential wide string (like in working version)
+        // Scan for potential wide string
         while i + 4 < data_len {
             let ptr = user_data.add(i) as *const u16;
             let mut temp_len = 0;
