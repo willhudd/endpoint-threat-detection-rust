@@ -3,7 +3,7 @@ mod events;
 mod monitoring;
 mod utils;
 
-use crate::monitoring::{process_monitor, network_monitor, correlation_engine};
+use crate::monitoring::{start_process_monitor, start_network_monitor, correlation_engine};
 use crate::utils::privilege;
 use simplelog::*;
 use std::sync::Arc;
@@ -65,12 +65,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Start monitors with shutdown signals
-    let process_handle = process_monitor::start_process_monitor(
+    let process_handle = start_process_monitor(
         process_tx.clone(), 
         Arc::clone(&config),
         Arc::clone(&process_shutdown)
     );
-    let network_handle = network_monitor::start_network_monitor(
+    let network_handle = start_network_monitor(
         network_tx.clone(), 
         Arc::clone(&config),
         Arc::clone(&network_shutdown)

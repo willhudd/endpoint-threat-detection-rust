@@ -74,9 +74,23 @@ fn process_event(
                     &format!("Suspicious process started: {}", process_event.process_name),
                     &process_event.process_name,
                     process_event.pid,
-                    vec![format!("Process: {}", process_event.process_name)],
+                    vec![format!("Process = {}", process_event.process_name)],
                 );
                 let _ = alert_tx.send(alert);
+                
+                // Enhanced alert logging
+                log::warn!(
+                    "╔═══════════════════════════════════════════\n\
+                     ║ 🚨 ALERT: Suspicious Process Detected\n\
+                     ╠═══════════════════════════════════════════\n\
+                     ║ Severity = HIGH\n\
+                     ║ Process  = {}\n\
+                     ║ PID      = {}\n\
+                     ║ Reason   = Matches suspicious process pattern\n\
+                     ╚═══════════════════════════════════════════",
+                    process_event.process_name,
+                    process_event.pid
+                );
             }
 
             // Store process context
@@ -100,62 +114,139 @@ fn process_event(
             if let Some(context) = process_contexts.get_mut(&network_event.pid) {
                 context.network_connections.push(chrono::Utc::now());
 
-                // Detect rapid connection attempts
-                if context.network_connections.len() > 5 {
+                // Detect rapid connection attempts (potential port scanning or C2)
+                if context.network_connections.len() > 10 {
                     let recent_connections = context.network_connections
                         .iter()
                         .filter(|&&time| time > chrono::Utc::now() - chrono::Duration::seconds(10))
                         .count();
 
-                    if recent_connections > 5 {
+                    if recent_connections > 10 {
                         let alert = Alert::new(
-                            crate::events::alert::AlertSeverity::Medium,
+                            crate::events::alert::AlertSeverity::High,
                             "RapidNetworkConnections",
-                            "Rapid network connections detected",
+                            "Rapid network connections detected - possible scanning or C2 activity",
                             &context.process_name,
                             context.pid,
-                            vec![format!("{} connections in 10 seconds", recent_connections)],
+                            vec![format!("Connections in 10s = {}", recent_connections)],
                         );
                         let _ = alert_tx.send(alert);
+                        
+                        log::warn!(
+                            "╔═══════════════════════════════════════════\n\
+                             ║ 🚨 ALERT: Rapid Network Connections\n\
+                             ╠═══════════════════════════════════════════\n\
+                             ║ Severity    = HIGH\n\
+                             ║ Process     = {}\n\
+                             ║ PID         = {}\n\
+                             ║ Connections = {} in 10 seconds\n\
+                             ║ Risk        = Port scanning or C2 communication\n\
+                             ╚═══════════════════════════════════════════",
+                            context.process_name,
+                            context.pid,
+                            recent_connections
+                        );
+                        
+                        // Clear old connections to avoid repeated alerts
+                        context.network_connections.retain(|&time| 
+                            time > chrono::Utc::now() - chrono::Duration::seconds(10)
+                        );
                     }
                 }
 
                 // Check for connections to suspicious destinations
                 if is_suspicious_destination(&network_event.remote_address, config) {
                     let alert = Alert::new(
-                        crate::events::alert::AlertSeverity::High,
+                        crate::events::alert::AlertSeverity::Critical,
                         "SuspiciousNetworkConnection",
-                        &format!("Connection to suspicious destination: {}", network_event.remote_address),
+                        &format!("Connection to known malicious destination: {}", network_event.remote_address),
                         &context.process_name,
                         context.pid,
                         vec![
-                            format!("Destination: {}", network_event.remote_address),
-                            format!("Port: {}", network_event.remote_port),
+                            format!("Destination = {}", network_event.remote_address),
+                            format!("Port = {}", network_event.remote_port),
                         ],
                     );
                     let _ = alert_tx.send(alert);
+                    
+                    log::error!(
+                        "╔═══════════════════════════════════════════\n\
+                         ║ 🚨 ALERT: Malicious Destination Detected\n\
+                         ╠═══════════════════════════════════════════\n\
+                         ║ Severity    = CRITICAL\n\
+                         ║ Process     = {}\n\
+                         ║ PID         = {}\n\
+                         ║ Destination = {}:{}\n\
+                         ║ Risk        = Connection to known malicious IP/domain\n\
+                         ╚═══════════════════════════════════════════",
+                        context.process_name,
+                        context.pid,
+                        network_event.remote_address,
+                        network_event.remote_port
+                    );
                 }
 
                 // Cross-reference: New process making network connections
                 let process_age = chrono::Utc::now() - context.start_time;
-                if process_age < chrono::Duration::seconds(5) && !context.network_connections.is_empty() {
+                if process_age < chrono::Duration::seconds(5) && 
+                   context.network_connections.len() == 1 &&
+                   !is_private_or_local(&network_event.remote_address) {
+                    
                     let alert = Alert::new(
                         crate::events::alert::AlertSeverity::Medium,
                         "NewProcessNetworkActivity",
-                        "New process making network connections",
+                        "Newly started process immediately made external network connection",
                         &context.process_name,
                         context.pid,
                         vec![
-                            format!("Process age: {} seconds", process_age.num_seconds()),
-                            format!("Connections made: {}", context.network_connections.len()),
+                            format!("Process age = {} seconds", process_age.num_seconds()),
+                            format!("Destination = {}:{}", network_event.remote_address, network_event.remote_port),
                         ],
                     );
                     let _ = alert_tx.send(alert);
+                    
+                    log::warn!(
+                        "╔═══════════════════════════════════════════\n\
+                         ║ 🚨 ALERT: Immediate Network Activity\n\
+                         ╠═══════════════════════════════════════════\n\
+                         ║ Severity    = MEDIUM\n\
+                         ║ Process     = {}\n\
+                         ║ PID         = {}\n\
+                         ║ Process Age = {} seconds\n\
+                         ║ Destination = {}:{}\n\
+                         ║ Risk        = Possible malware phone-home\n\
+                         ╚═══════════════════════════════════════════",
+                        context.process_name,
+                        context.pid,
+                        process_age.num_seconds(),
+                        network_event.remote_address,
+                        network_event.remote_port
+                    );
                 }
             }
         }
         _ => {}
     }
+}
+
+// Helper to check if address is private/local
+fn is_private_or_local(addr: &str) -> bool {
+    addr.starts_with("127.") ||
+    addr.starts_with("10.") ||
+    (addr.starts_with("172.") && {
+        if let Some(dot1) = addr.find('.') {
+            if let Some(dot2) = addr[dot1+1..].find('.') {
+                let second_octet = &addr[dot1+1..dot1+1+dot2];
+                if let Ok(num) = second_octet.parse::<u8>() {
+                    return num >= 16 && num <= 31;
+                }
+            }
+        }
+        false
+    }) ||
+    addr.starts_with("192.168.") ||
+    addr == "::1" ||
+    addr == "0:0:0:0:0:0:0:1"
 }
 
 fn cleanup_old_contexts(process_contexts: &mut HashMap<u32, ProcessContext>) {
@@ -187,19 +278,8 @@ fn is_suspicious_process(process_name: &str, config: &Config) -> bool {
         return false;
     }
     
-    let suspicious_names = vec![
-        "powershell.exe",
-        "cmd.exe",
-        "wscript.exe",
-        "cscript.exe",
-        "mshta.exe",
-        "rundll32.exe",
-        "regsvr32.exe",
-        "certutil.exe",
-    ];
-
+    // Use only the patterns from config, remove hardcoded list
     let name_lower = process_name.to_lowercase();
-    suspicious_names.iter().any(|&name| name_lower.contains(name)) ||
     config.suspicious_process_patterns.iter().any(|pattern| {
         let regex = regex::Regex::new(pattern).unwrap();
         regex.is_match(&name_lower)
@@ -207,22 +287,16 @@ fn is_suspicious_process(process_name: &str, config: &Config) -> bool {
 }
 
 fn is_suspicious_destination(address: &str, config: &Config) -> bool {
-    // Check against known malicious IPs/domains
-    let suspicious_domains = vec![
-        "malicious.com",
-        "evil-domain.net",
-    ];
-
     // Check if it's a private/internal address (less suspicious)
     if address.starts_with("192.168.") || 
        address.starts_with("10.") || 
        address.starts_with("127.") ||
-       address == "::1" {
+       address == "::1" ||
+       address == "0:0:0:0:0:0:0:1" {
         return false;
     }
 
-    // Check against suspicious patterns
-    suspicious_domains.iter().any(|&domain| address.contains(domain)) ||
+    // Check against suspicious patterns from config
     config.suspicious_network_patterns.iter().any(|pattern| {
         let regex = regex::Regex::new(pattern).unwrap();
         regex.is_match(address)
