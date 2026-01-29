@@ -4,8 +4,6 @@
 
 # Lightweight Endpoint Detection System - Rust
 
----
-
 ## 📌 Project Purpose
 
 This is a **prototype endpoint detection system** written in Rust, implementing real-time monitoring, behavioral analysis, and threat correlation for Windows endpoints.
