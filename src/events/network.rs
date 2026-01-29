@@ -11,6 +11,8 @@ pub struct NetworkEvent {
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub connection_state: ConnectionState,
+    pub domain: Option<String>,
+    pub data_size: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +26,7 @@ pub enum NetworkDirection {
 pub enum Protocol {
     TCP,
     UDP,
+    QUIC,
     Other(String),
 }
 
@@ -59,6 +62,8 @@ impl NetworkEvent {
             bytes_sent: 0,
             bytes_received: 0,
             connection_state: ConnectionState::Established,
+            domain: None,
+            data_size: None,
         }
     }
 }
