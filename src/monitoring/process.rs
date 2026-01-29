@@ -4,7 +4,7 @@ use crossbeam_channel::Sender;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::error::Error;
-use crate::monitoring::common::*;
+use crate::monitoring::common::{get_process_name_cached, cache_process_start, is_common_short_lived_process, cleanup_tracking_data, GLOBAL_SENDER};
 use windows::Win32::System::Diagnostics::Etw::*;
 use windows::core::PWSTR;
 use windows::{
@@ -27,8 +27,6 @@ pub fn start_kernel_monitor(
                 let mut guard = GLOBAL_SENDER.lock().unwrap();
                 *guard = Some(Arc::new(tx.clone()));
             }
-
-            log::info!("Attempting to start kernel ETW session...");
 
             let mut stop_buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 1024];
             let stop_props = stop_buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;

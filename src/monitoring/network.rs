@@ -4,7 +4,7 @@ use crossbeam_channel::Sender;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::error::Error;
-use crate::monitoring::common::*;
+use crate::monitoring::common::{is_browser_related_process, get_process_name_cached, GLOBAL_SENDER,create_connection_signature, ConnectionAttempt, get_timestamp, cleanup_tracking_data, RECENT_CONNECTIONS, CONNECTION_TRACKER, DNS_CACHE, QUIC_CONNECTIONS};
 use windows::Win32::System::Diagnostics::Etw::*;
 use windows::core::{GUID, PWSTR};
 use windows::{
@@ -142,19 +142,19 @@ fn should_log_connection(
 }
 
 fn is_suspicious_loopback(process_name: &str, sport: u16, dport: u16) -> bool {
-    let suspicious_processes = vec![
+    const SUSPICIOUS_PROCESSES: &[&str] = &[
         "powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe",
         "mshta.exe", "rundll32.exe",
     ];
     
     let lower_name = process_name.to_lowercase();
     
-    if suspicious_processes.iter().any(|&p| lower_name.contains(p)) {
+    if SUSPICIOUS_PROCESSES.iter().any(|&p| lower_name.contains(p)) {
         return true;
     }
     
-    let common_ports = vec![80, 443, 3389, 5985, 5986, 8080];
-    if !common_ports.contains(&sport) && !common_ports.contains(&dport) {
+    const COMMON_PORTS: &[u16] = &[80, 443, 3389, 5985, 5986, 8080];
+    if !COMMON_PORTS.contains(&sport) && !COMMON_PORTS.contains(&dport) {
         if sport < 49152 && dport < 49152 {
             return true;
         }
@@ -168,13 +168,13 @@ fn should_correlate(_pid: u32, process_name: &str, _dest_addr: &str, network_typ
         return true;
     }
     
-    let suspicious_names = vec![
+    const SUSPICIOUS_NAMES: &[&str] = &[
         "powershell", "cmd", "wscript", "cscript", 
         "mshta", "rundll32", "regsvr32", "certutil"
     ];
     
     let lower_name = process_name.to_lowercase();
-    if suspicious_names.iter().any(|&name| lower_name.contains(name)) {
+    if SUSPICIOUS_NAMES.iter().any(|&name| lower_name.contains(name)) {
         return true;
     }
     
@@ -195,8 +195,6 @@ pub fn start_tcpip_listener(
                 let mut guard = GLOBAL_SENDER.lock().unwrap();
                 *guard = Some(Arc::new(tx.clone()));
             }
-
-            log::info!("Starting TCP/IP ETW listener...");
 
             let session_name = widestring::U16CString::from_str("EDR_TCPIP_LOGGER").unwrap();
             
@@ -294,7 +292,7 @@ pub fn start_tcpip_listener(
                 }
 
                 if rec.UserDataLength > 0 && !rec.UserData.is_null() {
-                    let (saddr, daddr, sport, dport, is_ipv6) = match event_id {
+                    let (saddr, daddr, sport, dport, _is_ipv6) = match event_id {
                         EVENT_ID_TCPIP_SEND | EVENT_ID_TCPIP_RECV | 
                         EVENT_ID_TCPIP_CONNECT | EVENT_ID_TCPIP_DISCONNECT | 
                         EVENT_ID_TCPIP_RECONNECT | EVENT_ID_UDP_SEND | EVENT_ID_UDP_RECV => {
@@ -756,7 +754,8 @@ fn log_network_event(
     log::info!(
         "\n\
         ┌─ {}/IP Event{} ────────────────────────────────\n\
-        │ Process      = {} (PID: {})\n\
+        │ Process      = {}\n\
+        │ PID          = {}\n\
         │ Direction    = {}\n\
         │ Network Type = {}\n\
         │ Protocol     = {}\n\
@@ -787,7 +786,7 @@ fn identify_udp_service(port: u16) -> &'static str {
         3478 => "STUN",
         5353 => "mDNS",
         _ => {
-            if port >= 443 && port <= 443 {
+            if port == 443 {
                 "QUIC (HTTP/3)"
             } else {
                 "UDP"

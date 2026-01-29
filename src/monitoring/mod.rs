@@ -6,13 +6,11 @@ pub mod network;
 use crossbeam_channel::Sender;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::config::rules::Config;
 use std::time::Duration;
 
 // Process monitoring wrapper
 pub fn start_process_monitor(
     tx: Sender<crate::events::BaseEvent>,
-    _config: Arc<Config>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -30,7 +28,6 @@ pub fn start_process_monitor(
 // Network monitoring wrapper
 pub fn start_network_monitor(
     tx: Sender<crate::events::BaseEvent>,
-    _config: Arc<Config>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -51,7 +48,6 @@ fn run_network_monitor(
             }
             // Join the ETW thread when shutdown is requested
             let _ = handle.join();
-            return;
         }
         Err(e) => {
             log::error!("ETW listener failed: {}", e);
@@ -68,11 +64,9 @@ fn run_network_monitor(
                     }
                     let _ = handle.join();
                     log::info!("ETW network listener stopped");
-                    return;
                 }
                 Err(e) => {
                     log::error!("ETW listener unavailable after retry; exiting: {}", e);
-                    return;
                 }
             }
         }

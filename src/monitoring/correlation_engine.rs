@@ -1,7 +1,7 @@
 use crate::config::rules::Config;
 use crate::events::{Alert, BaseEvent, EventType};
 use crate::events::network::NetworkDirection;
-use crate::monitoring::common::{get_command_line_cached, get_parent_process_info};
+use crate::monitoring::common::{get_command_line_cached, get_parent_process_info, analyze_command_line, is_webhook_service, is_suspicious_domain, is_high_risk_port, describe_port, is_system_process, is_network_aware_process, categorize_process, is_scripting_engine, truncate_string};
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -41,13 +41,8 @@ struct ProcessContext {
     is_scripting_engine: bool,
     // Suspicious indicators
     suspicious_flags: Vec<String>,
-    // Memory for behavior analysis
-    keypress_count: u32,
-    last_keypress_time: Option<chrono::DateTime<chrono::Utc>>,
     // Timing for correlation
     process_age_at_first_network: Option<Duration>,
-    // Detected patterns
-    detected_patterns: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,8 +69,6 @@ struct AlertState {
     process_start_times: HashMap<u32, chrono::DateTime<chrono::Utc>>,
     // Track processes that have already been evaluated
     evaluated_processes: HashSet<u32>,
-    // Behavioral patterns across processes
-    global_suspicious_patterns: HashSet<String>,
     // IOC tracking
     known_malicious_ips: HashSet<String>,
     known_malicious_domains: HashSet<String>,
@@ -97,7 +90,6 @@ pub fn run_correlation_engine(
         verified_processes: HashSet::new(),
         process_start_times: HashMap::new(),
         evaluated_processes: HashSet::new(),
-        global_suspicious_patterns: HashSet::new(),
         known_malicious_ips: HashSet::new(),
         known_malicious_domains: HashSet::new(),
         known_malicious_ports: HashSet::new(),
@@ -186,7 +178,7 @@ fn handle_process_start(
     let is_known_good = is_known_good_process(process_name, &command_line);
     let is_browser_process = is_browser_related_process(process_name);
     let is_system_process = is_system_process(process_name);
-    let is_scripting_engine = is_scripting_engine_process(process_name, &command_line);
+    let is_scripting_engine = is_scripting_engine(process_name, &command_line);
 
     let keylogger_score = calculate_keylogger_score(process_name, &command_line);
     
@@ -206,10 +198,7 @@ fn handle_process_start(
         is_system_process,
         is_scripting_engine,
         suspicious_flags: suspicious_flags.clone(),
-        keypress_count: 0,
-        last_keypress_time: None,
         process_age_at_first_network: None,
-        detected_patterns: HashSet::new(),
     };
     
     process_contexts.insert(pid, context);
@@ -337,7 +326,7 @@ fn handle_network_connection(
         let is_known_good = is_known_good_process(process_name, &command_line);
         let is_browser_process = is_browser_related_process(process_name);
         let is_system_process = is_system_process(process_name);
-        let is_scripting_engine = is_scripting_engine_process(process_name, &command_line);
+        let is_scripting_engine = is_scripting_engine(process_name, &command_line);
         let suspicious_flags = analyze_command_line(process_name, &command_line);
         
         let ctx = ProcessContext {
@@ -356,10 +345,7 @@ fn handle_network_connection(
             is_system_process,
             is_scripting_engine,
             suspicious_flags,
-            keypress_count: 0,
-            last_keypress_time: None,
             process_age_at_first_network: None,
-            detected_patterns: HashSet::new(),
         };
         
         process_contexts.insert(pid, ctx);
@@ -471,8 +457,8 @@ fn calculate_keylogger_score(process_name: &str, command_line: &str) -> u8 {
         score = score.saturating_add(2);
     }
     
-    let special_keys = vec!["[backspace]", "[enter]", "[tab]", "[shift]", "[ctrl]", "[alt]"];
-    let special_key_count = special_keys.iter().filter(|&&key| lower_cmd.contains(key)).count();
+    const SPECIAL_KEYS: &[&str] = &["[backspace]", "[enter]", "[tab]", "[shift]", "[ctrl]", "[alt]"];
+    let special_key_count = SPECIAL_KEYS.iter().filter(|&&key| lower_cmd.contains(key)).count();
     if special_key_count >= 2 {
         score = score.saturating_add(2);
         log::warn!("🟠 Multiple special key patterns ({})", special_key_count);
@@ -516,59 +502,6 @@ fn calculate_keylogger_score(process_name: &str, command_line: &str) -> u8 {
     score
 }
 
-fn extract_keylogger_details(command_line: &str) -> String {
-    let lower_cmd = command_line.to_lowercase();
-    let mut indicators: Vec<String> = Vec::new();
-    
-    if lower_cmd.contains("getasynckeystate") {
-        indicators.push("• GetAsyncKeyState API (Windows keyboard hook)".to_string());
-    }
-    if lower_cmd.contains("[dllimport(\"user32.dll\")]") || lower_cmd.contains("[dllimport('user32.dll')]") {
-        indicators.push("• user32.dll DLL import".to_string());
-    }
-    if lower_cmd.contains("system.windows.forms") {
-        indicators.push("• System.Windows.Forms assembly".to_string());
-    }
-    if lower_cmd.contains("discord.com/api/webhooks") || lower_cmd.contains("discordapp.com/api/webhooks") {
-        indicators.push("• Discord webhook URL (exfiltration)".to_string());
-    }
-    if lower_cmd.contains("webhook.office.com") {
-        indicators.push("• Microsoft Teams webhook URL (exfiltration)".to_string());
-    }
-    if lower_cmd.contains("hooks.slack.com") {
-        indicators.push("• Slack webhook URL (exfiltration)".to_string());
-    }
-    if lower_cmd.contains("-windowstyle hidden") {
-        indicators.push("• Hidden window execution".to_string());
-    }
-    if lower_cmd.contains("-executionpolicy bypass") {
-        indicators.push("• Execution policy bypass".to_string());
-    }
-    if lower_cmd.contains("currentversion\\run") || lower_cmd.contains("currentversion/run") {
-        indicators.push("• Registry persistence (Run key)".to_string());
-    }
-    if lower_cmd.contains("while ($true)") || lower_cmd.contains("while (1)") {
-        indicators.push("• Infinite loop (continuous monitoring)".to_string());
-    }
-    if lower_cmd.contains("keylog") {
-        indicators.push("• 'keylog' in filename/variable".to_string());
-    }
-    
-    let special_keys = vec!["[backspace]", "[enter]", "[tab]", "[shift]", "[ctrl]", "[alt]"];
-    let found_keys: Vec<&str> = special_keys.iter()
-        .filter(|&&key| lower_cmd.contains(key))
-        .copied()
-        .collect();
-    if !found_keys.is_empty() {
-        indicators.push(format!("• Special key patterns: {}", found_keys.join(", ")));
-    }
-    
-    if indicators.is_empty() {
-        "No specific indicators extracted".to_string()
-    } else {
-        format!("Detected Indicators:\n{}", indicators.join("\n"))
-    }
-}
 
 fn check_webhook_exfiltration(
     context: &ProcessContext,
@@ -665,19 +598,6 @@ fn check_webhook_exfiltration(
     if remote_port == 443 {
         let lower_cmd = context.command_line.to_lowercase();
         if lower_cmd.contains("-windowstyle hidden") && context.network_connections.len() <= 3 {
-            let alert_message = format!(
-                "⚠️  SUSPICIOUS NETWORK ACTIVITY\n\
-                \n\
-                Hidden PowerShell making external HTTPS connection\n\
-                Process: {} (PID: {})\n\
-                Destination: {}:{}\n\
-                Pattern: Typical of data exfiltration",
-                context.process_name,
-                context.pid,
-                remote_addr,
-                remote_port
-            );
-            
             generate_alert(
                 crate::events::alert::AlertSeverity::Medium,
                 "HiddenPowerShellHTTPSConnection",
@@ -872,14 +792,14 @@ fn evaluate_network_alert(
         }
     }
     
-    // Rule 3: Connection to known malicious infrastructure (would require threat intel)
+    // Rule 3: Connection to known malicious infrastructure
     // This is we can integrate with threat intelligence feeds
     
     // Rule 4: Very suspicious patterns (e.g., process starts and immediately connects to high-risk port)
     if process_age < chrono::Duration::seconds(3) && 
        context.network_connections.len() == 1 &&
        is_high_risk_port(connection.remote_port) &&
-       is_suspicious_parent_process(context.parent_pid, &context.process_name, &context.parent_name) {
+       is_suspicious_parent_process(&context.process_name, &context.parent_name) {
         
         let alert_key = format!("immediate_highrisk:{}-{}", context.pid, connection.remote_port);
         if should_alert(&alert_key, alert_state, Duration::from_secs(600)) {
@@ -1037,100 +957,6 @@ fn is_known_good_process(process_name: &str, command_line: &str) -> bool {
     name_match
 }
 
-fn is_scripting_engine_process(process_name: &str, command_line: &str) -> bool {
-    let lower_name = process_name.to_lowercase();
-    let lower_cmd = command_line.to_lowercase();
-    
-    // Primary scripting engines
-    if lower_name.contains("powershell.exe") ||
-       lower_name.contains("pwsh.exe") ||
-       lower_name.contains("cmd.exe") ||
-       lower_name.contains("wscript.exe") ||
-       lower_name.contains("cscript.exe") ||
-       lower_name.contains("mshta.exe") ||
-       lower_name.ends_with(".ps1") ||
-       lower_name.ends_with(".vbs") ||
-       lower_name.ends_with(".js") ||
-       lower_name.ends_with(".hta") {
-        return true;
-    }
-    
-    // Check for script execution via rundll32, regsvr32, etc.
-    if lower_name.contains("rundll32.exe") && lower_cmd.contains(".dll,") {
-        return true;
-    }
-    
-    if lower_name.contains("regsvr32.exe") && 
-       (lower_cmd.contains(".dll") || lower_cmd.contains("/i:") || lower_cmd.contains("/s")) {
-        return true;
-    }
-    
-    // Check for certutil, bitsadmin, wmic with script-like arguments
-    if (lower_name.contains("certutil.exe") || 
-        lower_name.contains("bitsadmin.exe") || 
-        lower_name.contains("wmic.exe")) &&
-       (lower_cmd.contains("http://") || lower_cmd.contains("https://") || lower_cmd.contains(".xml")) {
-        return true;
-    }
-    
-    false
-}
-
-fn analyze_command_line(process_name: &str, command_line: &str) -> Vec<String> {
-    let mut suspicious_flags = Vec::new();
-    let lower_name = process_name.to_lowercase();
-    let lower_cmd = command_line.to_lowercase();
-    
-    // PowerShell-specific suspicious flags
-    if lower_name.contains("powershell") {
-        if lower_cmd.contains("-windowstyle hidden") || lower_cmd.contains("-w hidden") {
-            suspicious_flags.push("-WindowStyle Hidden".to_string());
-        }
-        if lower_cmd.contains("-executionpolicy bypass") || lower_cmd.contains("-ep bypass") {
-            suspicious_flags.push("-ExecutionPolicy Bypass".to_string());
-        }
-        if lower_cmd.contains("-noprofile") || lower_cmd.contains("-nop") {
-            suspicious_flags.push("-NoProfile".to_string());
-        }
-        if lower_cmd.contains("-encodedcommand") || lower_cmd.contains("-e ") {
-            suspicious_flags.push("-EncodedCommand".to_string());
-        }
-        if lower_cmd.contains("-noninteractive") {
-            suspicious_flags.push("-NonInteractive".to_string());
-        }
-        if lower_cmd.contains("iex ") || lower_cmd.contains("invoke-expression") {
-            suspicious_flags.push("Invoke-Expression".to_string());
-        }
-        if lower_cmd.contains("downloadstring") || lower_cmd.contains("downloadfile") {
-            suspicious_flags.push("Web Client Download".to_string());
-        }
-        if lower_cmd.contains("getasynckeystate") || lower_cmd.contains("keylog") {
-            suspicious_flags.push("Keylogging API".to_string());
-        }
-    }
-    
-    // Generic suspicious patterns
-    if lower_cmd.contains("webhook") || lower_cmd.contains("discord.com/api/webhooks") {
-        suspicious_flags.push("Webhook URL".to_string());
-    }
-    
-    if lower_cmd.contains("http://") || lower_cmd.contains("https://") {
-        if lower_name.contains("powershell") || lower_name.contains("cmd") || 
-           lower_name.contains("wscript") || lower_name.contains("cscript") {
-            suspicious_flags.push("Network Download in Script".to_string());
-        }
-    }
-    
-    // Obfuscation patterns
-    if lower_cmd.contains("frombase64string") || 
-       lower_cmd.contains("[convert]::") ||
-       lower_cmd.contains("-f ") && lower_cmd.contains("{0}") {
-        suspicious_flags.push("Obfuscation Patterns".to_string());
-    }
-    
-    suspicious_flags
-}
-
 fn is_keylogger_pattern(command_line: &str) -> bool {
     let lower_cmd = command_line.to_lowercase();
     
@@ -1205,39 +1031,6 @@ fn extract_keylogger_indicators(command_line: &str) -> String {
     }
 }
 
-fn is_webhook_service(domain: &str) -> bool {
-    let lower_domain = domain.to_lowercase();
-    
-    lower_domain.contains("discord.com") ||
-    lower_domain.contains("webhook.office.com") ||
-    lower_domain.contains("hooks.slack.com") ||
-    lower_domain.contains("webhooks.mongodb-realm.com") ||
-    lower_domain.contains("webhook.site") ||
-    lower_domain.ends_with(".webhook.app")
-}
-
-fn is_suspicious_domain(domain: &str) -> bool {
-    let lower_domain = domain.to_lowercase();
-    
-    // Check for domain generation algorithm (DGA) patterns
-    if lower_domain.chars().filter(|c| c.is_ascii_digit()).count() > 5 {
-        return true;
-    }
-    
-    // Check for excessive subdomains
-    if lower_domain.matches('.').count() > 4 {
-        return true;
-    }
-    
-    // Check for suspicious TLDs
-    let suspicious_tlds = vec![".xyz", ".top", ".club", ".bid", ".win", ".gq", ".ml", ".cf"];
-    if suspicious_tlds.iter().any(|tld| lower_domain.ends_with(tld)) {
-        return true;
-    }
-    
-    false
-}
-
 fn is_lolbas_pattern(process_name: &str, command_line: &str) -> bool {
     let lower_name = process_name.to_lowercase();
     let lower_cmd = command_line.to_lowercase();
@@ -1299,7 +1092,7 @@ fn is_highly_suspicious_connection(network_event: &crate::events::network::Netwo
     network_event.remote_address.starts_with("192.168.56.") && network_event.process_name.to_lowercase().contains("powershell")
 }
 
-fn is_suspicious_parent_process(parent_pid: u32, child_name: &str, parent_name: &str) -> bool {
+fn is_suspicious_parent_process(child_name: &str, parent_name: &str) -> bool {
     let child_lower = child_name.to_lowercase();
     let parent_lower = parent_name.to_lowercase();
     
@@ -1365,10 +1158,7 @@ fn check_temporal_correlations(
                         is_system_process: true,
                         is_scripting_engine: false,
                         suspicious_flags: Vec::new(),
-                        keypress_count: 0,
-                        last_keypress_time: None,
                         process_age_at_first_network: None,
-                        detected_patterns: HashSet::new(),
                     },
                     alert_tx,
                     vec![
@@ -1511,15 +1301,6 @@ fn load_initial_iocs(alert_state: &mut AlertState, config: &Config) {
     ]);
 }
 
-fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len])
-    }
-}
-
-// Keep existing functions that are still relevant...
 fn is_browser_related_process(process_name: &str) -> bool {
     let lower = process_name.to_lowercase();
     lower.contains("chrome") || 
@@ -1528,165 +1309,4 @@ fn is_browser_related_process(process_name: &str) -> bool {
     lower.contains("opera") || 
     lower.contains("brave") || 
     lower.contains("safari")
-}
-
-fn is_system_process(process_name: &str) -> bool {
-    let lower = process_name.to_lowercase();
-    lower.contains("svchost.exe") ||
-    lower.contains("system") ||
-    lower.contains("csrss.exe") ||
-    lower.contains("wininit.exe") ||
-    lower.contains("services.exe") ||
-    lower.contains("lsass.exe") ||
-    lower.contains("winlogon.exe") ||
-    lower.contains("explorer.exe") ||
-    lower.contains("dwm.exe") ||
-    lower.contains("taskhostw.exe")
-}
-
-fn is_network_aware_process(process_name: &str) -> bool {
-    let lower = process_name.to_lowercase();
-    lower.contains("chrome.exe") ||
-    lower.contains("firefox.exe") ||
-    lower.contains("msedge.exe") ||
-    lower.contains("spotify.exe") ||
-    lower.contains("teams.exe") ||
-    lower.contains("slack.exe") ||
-    lower.contains("zoom.exe") ||
-    lower.contains("discord.exe") ||
-    lower.contains("outlook.exe") ||
-    lower.contains("thunderbird.exe")
-}
-
-fn is_common_legitimate_connection(process_name: &str, port: u16) -> bool {
-    let lower = process_name.to_lowercase();
-    
-    // Common legitimate ports for common applications
-    match port {
-        // Web traffic (HTTPS)
-        443 => {
-            lower.contains("chrome.exe") ||
-            lower.contains("firefox.exe") ||
-            lower.contains("msedge.exe") ||
-            lower.contains("spotify.exe") ||
-            lower.contains("code.exe") ||
-            lower.contains("teams.exe") ||
-            lower.contains("slack.exe") ||
-            lower.contains("zoom.exe") ||
-            lower.contains("discord.exe") ||
-            lower.contains("onedrive.exe") ||
-            lower.contains("dropbox.exe")
-        },
-        // HTTP
-        80 => {
-            lower.contains("chrome.exe") ||
-            lower.contains("firefox.exe") ||
-            lower.contains("msedge.exe") ||
-            lower.contains("spotify.exe")
-        },
-        // DNS
-        53 => true, // DNS is always legitimate
-        // NTP
-        123 => true,
-        // Common update/cloud ports
-        8080 | 8443 => {
-            lower.contains("code.exe") ||
-            lower.contains("spotify.exe") ||
-            lower.contains("steam.exe")
-        },
-        _ => false,
-    }
-}
-
-fn is_suspicious_port(port: u16) -> bool {
-    // Only truly suspicious/malware ports
-    match port {
-        4444 => true,  // Metasploit
-        31337 => true, // Back Orifice
-        6667 => true,  // IRC
-        6660 => true,  // IRC
-        9999 => true,  // Common malware
-        5555 => true,  // Common malware
-        8877 => true,  // Common malware
-        1337 => true,  // Common malware
-        8443 => false, // Often legitimate (HTTPS alternative)
-        8080 => false, // Often legitimate (HTTP alternative)
-        _ => port >= 49152 && port <= 65535, // Dynamic/private ports are usually ok
-    }
-}
-
-fn is_high_risk_port(port: u16) -> bool {
-    // Ports commonly associated with malware/C2
-    matches!(port, 
-        4444 | 31337 | 6667 | 6660 | 9999 | 5555 | 8877 | 1337 | 
-        1234 | 4321 | 6789 | 9898 | 9988 | 2333 | 2334
-    )
-}
-
-fn describe_port(port: u16) -> &'static str {
-    match port {
-        4444 => "Metasploit default",
-        31337 => "Back Orifice",
-        6667 => "IRC",
-        6660 => "IRC",
-        9999 => "Common malware",
-        5555 => "Common malware",
-        8877 => "Common malware",
-        1337 => "Elite/Leet port",
-        3389 => "RDP",
-        22 => "SSH",
-        23 => "Telnet",
-        21 => "FTP",
-        25 => "SMTP",
-        110 => "POP3",
-        143 => "IMAP",
-        445 => "SMB",
-        135 => "RPC",
-        _ => "Unknown",
-    }
-}
-
-fn categorize_process(process_name: &str) -> &'static str {
-    let lower = process_name.to_lowercase();
-    if lower.contains("powershell") || lower.contains("pwsh") {
-        "PowerShell"
-    } else if lower.contains("cmd.exe") {
-        "Command Prompt"
-    } else if lower.contains("wscript.exe") || lower.contains("cscript.exe") {
-        "Windows Script Host"
-    } else if lower.contains("mshta.exe") {
-        "HTML Application"
-    } else if lower.contains("regsvr32.exe") {
-        "DLL Registration"
-    } else if lower.contains("rundll32.exe") {
-        "DLL Execution"
-    } else if lower.contains("certutil.exe") {
-        "Certificate Utility"
-    } else if lower.contains("bitsadmin.exe") {
-        "Background Intelligent Transfer"
-    } else if lower.ends_with(".ps1") {
-        "PowerShell Script"
-    } else if lower.ends_with(".vbs") {
-        "VBScript"
-    } else if lower.ends_with(".js") {
-        "JavaScript"
-    } else if lower.ends_with(".hta") {
-        "HTML Application"
-    } else if lower.contains("chrome.exe") {
-        "Chrome Browser"
-    } else if lower.contains("firefox.exe") {
-        "Firefox Browser"
-    } else if lower.contains("msedge.exe") {
-        "Edge Browser"
-    } else if lower.contains("code.exe") {
-        "VS Code"
-    } else if lower.contains("spotify.exe") {
-        "Spotify"
-    } else if lower.contains("nvidia") {
-        "NVIDIA"
-    } else if lower.contains("searchhost.exe") {
-        "Windows Search"
-    } else {
-        "Application"
-    }
 }
