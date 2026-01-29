@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-windows = { version = "0.61", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Services",
     "Win32_Security",
@@ -23,6 +23,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_System_Diagnostics_Debug",
     "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
