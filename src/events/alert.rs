@@ -35,20 +35,20 @@ impl fmt::Display for Alert {
 
 impl Alert {
     pub fn new(
-        severity: AlertSeverity,
+        severity: &AlertSeverity,
         rule_name: &str,
         description: &str,
         process_name: &str,
         pid: u32,
-        evidence: Vec<String>,
+        details: &[String],
     ) -> Self {
         Self {
-            severity,
+            severity: severity.clone(),
             rule_name: rule_name.to_string(),
             description: description.to_string(),
             process_name: process_name.to_string(),
             pid,
-            evidence,
+            evidence: details.to_vec(),
             timestamp: chrono::Utc::now(),
         }
     }

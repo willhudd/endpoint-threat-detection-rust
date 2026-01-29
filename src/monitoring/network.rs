@@ -27,8 +27,6 @@ const EVENT_ID_TCPIP_RECONNECT: u16 = 16;
 const EVENT_ID_UDP_SEND: u16 = 42;
 const EVENT_ID_UDP_RECV: u16 = 43;
 
-const EVENT_TRACE_FLAG_NETWORK_TCPIP: u32 = 0x00000100;
-
 // TCP/IP event data structures
 #[repr(C)]
 struct TcpIpV4Event {
@@ -290,7 +288,7 @@ pub fn start_tcpip_listener(
                     let lower = process_name.to_lowercase();
                     if lower.contains("svchost") || lower.contains("system") ||
                        lower.contains("csrss") || lower.contains("wininit") ||
-                       lower.contains("services") {
+                       lower.contains("services") || lower.contains("endpoint-threat-detection") {
                         return;
                     }
                 }
@@ -413,8 +411,6 @@ pub fn start_tcpip_listener(
                 }
             }
 
-            log::info!("🛑 Stopping TCP/IP ETW session...");
-
             let _ = CloseTrace(trace_handle);
             
             let _ = ControlTraceW(
@@ -471,8 +467,13 @@ fn handle_udp_event(
         }
         
         if should_log_dns {
-            log::debug!(
-                "🔍 DNS: {} (PID:{}) querying {}",
+            log::info!(
+                "\n\
+                ┌─ DNS Event ─────────────────────────────\n\
+                │ Process Name = {}\n\
+                │ PID  = {}\n\
+                │ Destination = {}\n\
+                └───────────────────────────────────────────────",
                 process_name, pid, daddr
             );
         }
@@ -489,8 +490,14 @@ fn handle_udp_event(
         if let Ok(mut dns_cache) = DNS_CACHE.lock() {
             if !dns_cache.contains(&multicast_sig) {
                 dns_cache.insert(multicast_sig);
-                log::debug!(
-                    "📡 Multicast: {} (PID:{}) using {} on {}:{}",
+                log::info!(
+                    "\n\
+                    ┌─ Multicast Event ─────────────────────────────\n\
+                    │ Process Name = {}\n\
+                    │ PID  = {}\n\
+                    │ Protocol = {}\n\
+                    │ Destination = {}:{}\n\
+                    └───────────────────────────────────────────────",
                     process_name, pid,
                     if dport == 1900 { "SSDP" } else if dport == 5353 { "mDNS" } else { "Multicast" },
                     daddr, dport
@@ -519,9 +526,14 @@ fn handle_udp_event(
         
         if should_log {
             log::info!(
-                "🚀 QUIC/HTTP3: {} (PID:{}) -> {}:{} {}",
-                process_name, pid, daddr, dport,
-                identify_ip_owner(daddr)
+                "\n\
+                ┌─ QUIC/HTTP3 Event ─────────────────────────────\n\
+                │ Process Name = {}\n\
+                │ PID  = {}\n\
+                │ Destination = {}:{}\n\
+                │ IP Owner = {}\n\
+                └───────────────────────────────────────────────",
+                process_name, pid, daddr, dport, identify_ip_owner(daddr)
             );
             
             // Create network event for correlation
@@ -551,8 +563,15 @@ fn handle_udp_event(
     
     // Other UDP - only log external
     if network_type == "External" {
-        log::debug!(
-            "UDP: {} (PID:{}) {} -> {}:{} ({})",
+        log::info!(
+            "\n\
+            ┌─ UDP Event ─────────────────────────────\n\
+            │ Process Name = {}\n\
+            │ PID  = {}\n\
+            │ Direction = {}\n\
+            │ Destination = {}:{}\n\
+            │ Network Type = {}\n\
+            └───────────────────────────────────────────────",
             process_name, pid, 
             if event_id == EVENT_ID_UDP_SEND { "Send" } else { "Recv" },
             daddr, dport, network_type
@@ -728,47 +747,34 @@ fn log_network_event(
 ) {
     let browser_tag = if is_browser { " [BROWSER]" } else { "" };
     
-    if network_type == "External" {
-        let protocol_type = if protocol == "UDP" { 
-            identify_udp_service(dport) 
-        } else { 
-            "IPv4"
-        };
-        
-        log::info!(
-            "┌─ {}/IP Event{} ────────────────────────────────\n\
-             │ Process      = {} (PID: {})\n\
-             │ Direction    = {}\n\
-             │ Network Type = {}\n\
-             │ Protocol     = {}\n\
-             │ Source       = {}:{}\n\
-             │ Destination  = {}:{}\n\
-             └───────────────────────────────────────────────",
-            protocol,
-            browser_tag,
-            process_name,
-            pid,
-            direction,
-            network_type,
-            protocol_type,
-            saddr,
-            sport,
-            daddr,
-            dport
-        );
-    } else {
-        log::debug!(
-            "{}/IP{}: {} (PID:{}) {} -> {}:{} ({})",
-            protocol,
-            browser_tag,
-            process_name,
-            pid,
-            direction,
-            daddr,
-            dport,
-            network_type
-        );
-    }
+    let protocol_type = if protocol == "UDP" { 
+        identify_udp_service(dport) 
+    } else { 
+        "IPv4"
+    };
+    
+    log::info!(
+        "\n\
+        ┌─ {}/IP Event{} ────────────────────────────────\n\
+        │ Process      = {} (PID: {})\n\
+        │ Direction    = {}\n\
+        │ Network Type = {}\n\
+        │ Protocol     = {}\n\
+        │ Source       = {}:{}\n\
+        │ Destination  = {}:{}\n\
+        └───────────────────────────────────────────────",
+        protocol,
+        browser_tag,
+        process_name,
+        pid,
+        direction,
+        network_type,
+        protocol_type,
+        saddr,
+        sport,
+        daddr,
+        dport
+    );
 }
 
 fn identify_udp_service(port: u16) -> &'static str {

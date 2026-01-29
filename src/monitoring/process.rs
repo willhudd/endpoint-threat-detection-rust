@@ -94,28 +94,26 @@ pub fn start_kernel_monitor(
                 let lower = process_name.to_lowercase();
                 if lower.contains("svchost") || lower.contains("system") ||
                    lower.contains("csrss") || lower.contains("wininit") ||
-                   lower.contains("services") {
+                   lower.contains("services") || lower.contains("endpoint-threat-detection") {
                     return;
                 }
 
                 let event_result = match opcode {
                     1 => {
                         // Process start - CACHE IMMEDIATELY
-                        let parent_pid = if rec.UserDataLength >= 4 && !rec.UserData.is_null() {
-                            unsafe { *(rec.UserData as *const u32) }
-                        } else {
-                            0
-                        };
+                        // ETW doesn't reliably provide PPID in UserData for Process events
+                        // We'll get it later via WMI/CIM if needed
+                        let parent_pid = 0;
                         
                         cache_process_start(pid, parent_pid, &process_name, None);
                         
                         log::info!(
-                            "┌─ Process Started ─────────────────────────────\n\
+                            "\n\
+                             ┌─ Process Started ─────────────────────────────\n\
                              │ Name = {}\n\
                              │ PID  = {}\n\
-                             │ PPID = {}\n\
                              └───────────────────────────────────────────────",
-                            process_name, pid, parent_pid
+                            process_name, pid
                         );
                         
                         let event = ProcessEvent::new_start(pid, parent_pid, process_name.clone());
@@ -124,7 +122,8 @@ pub fn start_kernel_monitor(
                     2 => {
                         if !is_common_short_lived_process(&process_name) {
                             log::info!(
-                                "┌─ Process Ended ───────────────────────────────\n\
+                                "\n\
+                                 ┌─ Process Ended ───────────────────────────────\n\
                                  │ Name = {}\n\
                                  │ PID  = {}\n\
                                  └───────────────────────────────────────────────",
@@ -179,8 +178,6 @@ pub fn start_kernel_monitor(
                     cleanup_counter = 0;
                 }
             }
-
-            log::info!("🛑 Stopping kernel ETW session...");
 
             let _ = CloseTrace(trace_handle);
             let _ = ControlTraceW(session_handle, KERNEL_LOGGER_NAMEW, props, EVENT_TRACE_CONTROL_STOP);

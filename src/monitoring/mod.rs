@@ -16,11 +16,9 @@ pub fn start_process_monitor(
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        log::info!("Starting process monitor (ETW kernel)...");
         match process::start_kernel_monitor(tx, shutdown) {
             Ok(handle) => {
                 let _ = handle.join();
-                log::info!("Process monitor stopped");
             }
             Err(e) => {
                 log::error!("Failed to start kernel ETW monitor: {}", e);
@@ -36,9 +34,7 @@ pub fn start_network_monitor(
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        log::info!("Network monitor starting...");
         run_network_monitor(tx, shutdown);
-        log::info!("Network monitor stopped");
     })
 }
 
@@ -49,14 +45,12 @@ fn run_network_monitor(
     // Try to start an ETW-based listener first
     match start_etw_listener(tx.clone(), shutdown.clone()) {
         Ok(handle) => {
-            log::info!("ETW network listener started");
             // Wait for shutdown signal while ETW is running
             while !shutdown.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(200));
             }
             // Join the ETW thread when shutdown is requested
             let _ = handle.join();
-            log::info!("ETW network listener stopped");
             return;
         }
         Err(e) => {

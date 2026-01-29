@@ -76,31 +76,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&network_shutdown)
     );
 
-    // Alert handler
-    let alert_handle = std::thread::spawn({
-        let alert_shutdown = Arc::clone(&alert_shutdown);
-        move || {
-            log::info!("Alert handler started");
-            while alert_shutdown.load(Ordering::Relaxed) {
-                match alert_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(alert) => {
-                        log::warn!("🚨 ALERT: {}", alert);
-                        // Here you could add alert sending (email, API, etc.)
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        // Continue checking
-                        continue;
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        log::info!("Alert channel disconnected");
-                        break;
-                    }
-                }
-            }
-            log::info!("Alert handler stopped");
-        }
-    });
-
     log::info!("=========================================");
     log::info!("       EDR System Running");
     log::info!("=========================================");
@@ -175,7 +150,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         process_handle,
         network_handle,
         correlation_handle,
-        alert_handle,
     );
 
     Ok(())
@@ -192,7 +166,6 @@ fn perform_shutdown(
     process_handle: std::thread::JoinHandle<()>,
     network_handle: std::thread::JoinHandle<()>,
     correlation_handle: std::thread::JoinHandle<()>,
-    alert_handle: std::thread::JoinHandle<()>,
 ) {
     log::info!("");
     log::info!("=========================================");
@@ -208,20 +181,15 @@ fn perform_shutdown(
     alert_shutdown.store(false, Ordering::Relaxed);
 
     // Close channels to unblock threads
-    log::info!("🔌 Closing communication channels...");
     drop(process_tx);
     drop(network_tx);
     drop(alert_tx);
-
-    // Wait for all threads to complete
-    log::info!("⏳ Waiting for components to shutdown...");
     
-    // Define shutdown order (network first, then correlation, then process, then alert)
+    // Define shutdown order (network first, then correlation, then process)
     let components = vec![
         ("Network Monitor", network_handle),
         ("Correlation Engine", correlation_handle),
         ("Process Monitor", process_handle),
-        ("Alert Handler", alert_handle),
     ];
     
     for (name, handle) in components {
@@ -234,16 +202,12 @@ fn perform_shutdown(
     }
 
     // Verify ETW session is stopped
-    log::info!("");
     log::info!("🔍 Verifying ETW session cleanup...");
     verify_etw_cleanup();
-    
     log::info!("");
     log::info!("=========================================");
     log::info!("       Shutdown Complete");
     log::info!("=========================================");
-    log::info!("✅ All components stopped");
-    log::info!("✅ System ready for next run");
 }
 
 // Helper function to join threads with timeout

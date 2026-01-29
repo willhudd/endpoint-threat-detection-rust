@@ -1,34 +1,195 @@
 {
-  "suspicious_process_patterns": [
-    "(?i).*\\.(ps1|vbs|js|hta|bat|cmd)$",
-    "(?i).*(powershell|cmd|wscript|cscript|mshta).*"
-  ],
-  "suspicious_network_patterns": [
-    "(?i).*(tor|proxy|vpn).*",
-    "\\d+\\.\\d+\\.\\d+\\.\\d+:\\d{4,5}"
-  ],
-  "alert_thresholds": {
-    "max_connections_per_minute": 100,
-    "max_processes_per_minute": 50,
-    "suspicious_port_range": [49152, 65535]
-  },
-  "correlation_rules": [
+  "alert_rules": [
     {
-      "name": "NewProcessNetworkActivity",
-      "description": "New process making network connections within 5 seconds",
-      "severity": "Medium",
+      "name": "KeyloggerImmediateDetection",
+      "description": "High-confidence keylogger detected via command line analysis",
+      "severity": "Critical",
+      "enabled": true,
+      "cooldown_seconds": 60,
+      "conditions": [
+        {
+          "field": "keylogger_score",
+          "operator": ">=",
+          "value": "3"
+        }
+      ]
+    },
+    {
+      "name": "KeyloggerAPIDetection",
+      "description": "GetAsyncKeyState API usage detected",
+      "severity": "Critical",
+      "enabled": true,
+      "cooldown_seconds": 60,
+      "conditions": [
+        {
+          "field": "command_line",
+          "operator": "contains",
+          "value": "getasynckeystate"
+        },
+        {
+          "field": "process_type",
+          "operator": "in",
+          "value": "scripting"
+        }
+      ]
+    },
+    {
+      "name": "WebhookExfiltrationWithKeylogging",
+      "description": "Scripting engine with keylogging indicators connecting to webhook",
+      "severity": "Critical",
+      "enabled": true,
+      "cooldown_seconds": 60,
+      "conditions": [
+        {
+          "field": "is_scripting_engine",
+          "operator": "==",
+          "value": "true"
+        },
+        {
+          "field": "destination_domain",
+          "operator": "in",
+          "value": "webhook_services"
+        },
+        {
+          "field": "suspicious_flags",
+          "operator": "contains_any",
+          "value": "Keylogging API,Webhook URL"
+        }
+      ]
+    },
+    {
+      "name": "HiddenPowerShellWithPersistence",
+      "description": "Hidden PowerShell establishing registry persistence",
+      "severity": "High",
+      "enabled": true,
+      "cooldown_seconds": 120,
+      "conditions": [
+        {
+          "field": "process_name",
+          "operator": "==",
+          "value": "powershell.exe"
+        },
+        {
+          "field": "command_line",
+          "operator": "contains_all",
+          "value": "-WindowStyle Hidden,CurrentVersion\\Run"
+        }
+      ]
+    },
+    {
+      "name": "ImmediateC2Connection",
+      "description": "New process making immediate external connection",
+      "severity": "Critical",
+      "enabled": true,
+      "cooldown_seconds": 300,
       "conditions": [
         {
           "field": "process_age",
           "operator": "<",
-          "value": "5"
+          "value": "2"
         },
         {
-          "field": "network_connections",
-          "operator": ">",
-          "value": "0"
+          "field": "connection_count",
+          "operator": "==",
+          "value": "1"
+        },
+        {
+          "field": "is_external",
+          "operator": "==",
+          "value": "true"
         }
       ]
     }
-  ]
+  ],
+  "trusted_processes": [
+    "svchost.exe",
+    "dwm.exe",
+    "taskhostw.exe",
+    "runtimebroker.exe",
+    "conhost.exe",
+    "dllhost.exe",
+    "backgroundtaskhost.exe"
+  ],
+  "suspicious_process_types": [
+    ".ps1",
+    ".vbs",
+    ".js",
+    ".hta",
+    "mshta.exe",
+    "regsvr32.exe",
+    "rundll32.exe",
+    "certutil.exe",
+    "bitsadmin.exe"
+  ],
+  "keylogger_indicators": {
+    "api_calls": [
+      "getasynckeystate",
+      "getkeystate",
+      "getforegroundwindow",
+      "getwindowtext",
+      "registerrawinputdevices",
+      "setkeyboardhook",
+      "setwindowshookex"
+    ],
+    "dll_imports": ["user32.dll", "kernel32.dll"],
+    "key_patterns": [
+      "[backspace]",
+      "[tab]",
+      "[enter]",
+      "[shift]",
+      "[ctrl]",
+      "[alt]",
+      "[capslock]",
+      "[delete]"
+    ],
+    "file_indicators": [
+      "keylog",
+      "keylogs",
+      "keystroke",
+      "keys.txt",
+      "log.txt"
+    ],
+    "assemblies": ["system.windows.forms", "system.runtime.interopservices"]
+  },
+  "webhook_services": [
+    "discord.com",
+    "discordapp.com",
+    "webhook.office.com",
+    "hooks.slack.com",
+    "webhook.site",
+    "webhooks.mongodb-realm.com"
+  ],
+  "persistence_locations": [
+    "hkcu:\\software\\microsoft\\windows\\currentversion\\run",
+    "hklm:\\software\\microsoft\\windows\\currentversion\\run",
+    "startup folder",
+    "scheduled task",
+    "wmi event subscription"
+  ],
+  "network_baselines": {
+    "max_connections_per_minute": {
+      "chrome.exe": 100,
+      "firefox.exe": 50,
+      "msedge.exe": 100,
+      "powershell.exe": 5,
+      "cmd.exe": 3
+    },
+    "allowed_ports_per_process": {
+      "chrome.exe": [80, 443, 53],
+      "firefox.exe": [80, 443, 53],
+      "msedge.exe": [80, 443, 53]
+    },
+    "suspicious_parent_child": [
+      ["explorer.exe", "powershell.exe"],
+      ["svchost.exe", "cmd.exe"],
+      ["services.exe", "wscript.exe"],
+      ["winword.exe", "powershell.exe"],
+      ["excel.exe", "powershell.exe"]
+    ]
+  },
+  "alert_cooldowns": {
+    "per_rule_minutes": 1,
+    "per_process_minutes": 5,
+    "global_minutes": 1
+  }
 }
