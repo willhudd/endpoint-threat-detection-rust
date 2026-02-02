@@ -1,7 +1,6 @@
 use crate::config::rules::Config;
 use crate::events::{Alert, BaseEvent, EventType};
-use crate::events::network::NetworkDirection;
-use crate::monitoring::common::{get_command_line_cached, get_parent_process_info, analyze_command_line, is_webhook_service, is_suspicious_domain, is_high_risk_port, describe_port, is_system_process, is_network_aware_process, categorize_process, is_scripting_engine, truncate_string};
+use crate::monitoring::common::{get_command_line_cached, get_parent_process_info, analyze_command_line, is_webhook_service, is_suspicious_domain, is_high_risk_port, describe_port, is_network_aware_process, categorize_process, is_scripting_engine, truncate_string};
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -36,8 +35,6 @@ struct ProcessContext {
     alert_count: u32,
     // Behavior patterns
     is_known_good: bool,
-    is_browser_process: bool,
-    is_system_process: bool,
     is_scripting_engine: bool,
     // Suspicious indicators
     suspicious_flags: Vec<String>,
@@ -48,15 +45,11 @@ struct ProcessContext {
 #[derive(Clone, Debug)]
 struct NetworkConnection {
     timestamp: chrono::DateTime<chrono::Utc>,
-    direction: NetworkDirection,
     protocol: String,
-    local_addr: String,
-    local_port: u16,
     remote_addr: String,
     remote_port: u16,
     remote_domain: Option<String>,
     is_external: bool,
-    is_private_destination: bool,
     data_size: Option<u64>,
 }
 
@@ -103,17 +96,17 @@ pub fn run_correlation_engine(
         crossbeam_channel::select! {
             recv(process_rx) -> event => {
                 if let Ok(event) = event {
-                    process_event(&event, &mut process_contexts, &mut alert_state, &alert_tx, &config);
+                    process_event(&event, &mut process_contexts, &mut alert_state, &alert_tx);
                 }
             },
             recv(network_rx) -> event => {
                 if let Ok(event) = event {
-                    process_event(&event, &mut process_contexts, &mut alert_state, &alert_tx, &config);
+                    process_event(&event, &mut process_contexts, &mut alert_state, &alert_tx);
                 }
             },
             recv(crossbeam_channel::after(Duration::from_millis(100))) -> _ => {
                 cleanup_old_contexts(&mut process_contexts, &mut alert_state);
-                check_temporal_correlations(&mut process_contexts, &mut alert_state, &alert_tx, &config);
+                check_temporal_correlations(&mut process_contexts, &mut alert_state, &alert_tx);
             }
         }
     }
@@ -124,7 +117,6 @@ fn process_event(
     process_contexts: &mut HashMap<u32, ProcessContext>,
     alert_state: &mut AlertState,
     alert_tx: &Sender<Alert>,
-    config: &Config,
 ) {
     // Store event for cross-correlation
     let (pid, process_name) = match &event.event_type {
@@ -142,13 +134,13 @@ fn process_event(
     
     match &event.event_type {
         EventType::ProcessStart(process_event) => {
-            handle_process_start(process_event, process_contexts, alert_state, alert_tx, config);
+            handle_process_start(process_event, process_contexts, alert_state, alert_tx);
         }
         EventType::ProcessEnd(process_event) => {
             handle_process_end(process_event, process_contexts, alert_state);
         }
         EventType::NetworkConnection(network_event) => {
-            handle_network_connection(network_event, process_contexts, alert_state, alert_tx, config);
+            handle_network_connection(network_event, process_contexts, alert_state, alert_tx);
         }
         _ => {}
     }
@@ -159,7 +151,6 @@ fn handle_process_start(
     process_contexts: &mut HashMap<u32, ProcessContext>,
     alert_state: &mut AlertState,
     alert_tx: &Sender<Alert>,
-    config: &Config,
 ) {
     let process_name = &process_event.process_name;
     let pid = process_event.pid;
@@ -176,8 +167,6 @@ fn handle_process_start(
     
     // Enhanced process classification
     let is_known_good = is_known_good_process(process_name, &command_line);
-    let is_browser_process = is_browser_related_process(process_name);
-    let is_system_process = is_system_process(process_name);
     let is_scripting_engine = is_scripting_engine(process_name, &command_line);
 
     let keylogger_score = calculate_keylogger_score(process_name, &command_line);
@@ -194,8 +183,6 @@ fn handle_process_start(
         last_alert_time: None,
         alert_count: 0,
         is_known_good,
-        is_browser_process,
-        is_system_process,
         is_scripting_engine,
         suspicious_flags: suspicious_flags.clone(),
         process_age_at_first_network: None,
@@ -304,7 +291,6 @@ fn handle_network_connection(
     process_contexts: &mut HashMap<u32, ProcessContext>,
     alert_state: &mut AlertState,
     alert_tx: &Sender<Alert>,
-    config: &Config,
 ) {
     let pid = network_event.pid;
     let process_name = &network_event.process_name;
@@ -324,8 +310,6 @@ fn handle_network_connection(
         
         let command_line = get_command_line_cached(pid).unwrap_or_default();
         let is_known_good = is_known_good_process(process_name, &command_line);
-        let is_browser_process = is_browser_related_process(process_name);
-        let is_system_process = is_system_process(process_name);
         let is_scripting_engine = is_scripting_engine(process_name, &command_line);
         let suspicious_flags = analyze_command_line(process_name, &command_line);
         
@@ -341,8 +325,6 @@ fn handle_network_connection(
             last_alert_time: None,
             alert_count: 0,
             is_known_good,
-            is_browser_process,
-            is_system_process,
             is_scripting_engine,
             suspicious_flags,
             process_age_at_first_network: None,
@@ -376,20 +358,16 @@ fn handle_network_connection(
     
     let connection = NetworkConnection {
         timestamp: chrono::Utc::now(),
-        direction: network_event.direction.clone(),
         protocol: match &network_event.protocol {
             crate::events::network::Protocol::TCP => "TCP".to_string(),
             crate::events::network::Protocol::UDP => "UDP".to_string(),
             crate::events::network::Protocol::QUIC => "QUIC".to_string(),
             crate::events::network::Protocol::Other(proto) => proto.clone(),
         },
-        local_addr: network_event.local_address.clone(),
-        local_port: network_event.local_port,
         remote_addr: network_event.remote_address.clone(),
         remote_port: network_event.remote_port,
         remote_domain,
         is_external,
-        is_private_destination,
         data_size: network_event.data_size,
     };
     
@@ -408,7 +386,6 @@ fn handle_network_connection(
             &connection,
             alert_state,
             alert_tx,
-            config,
         );
     }
 }
@@ -693,7 +670,6 @@ fn evaluate_network_alert(
     connection: &NetworkConnection,
     alert_state: &mut AlertState,
     alert_tx: &Sender<Alert>,
-    config: &Config,
 ) {
     let now = chrono::Utc::now();
     
@@ -1109,7 +1085,6 @@ fn check_temporal_correlations(
     process_contexts: &mut HashMap<u32, ProcessContext>,
     alert_state: &mut AlertState,
     alert_tx: &Sender<Alert>,
-    config: &Config,
 ) {
     let now = chrono::Utc::now();
     
@@ -1154,8 +1129,6 @@ fn check_temporal_correlations(
                         last_alert_time: None,
                         alert_count: 0,
                         is_known_good: false,
-                        is_browser_process: false,
-                        is_system_process: true,
                         is_scripting_engine: false,
                         suspicious_flags: Vec::new(),
                         process_age_at_first_network: None,
@@ -1299,14 +1272,4 @@ fn load_initial_iocs(alert_state: &mut AlertState, config: &Config) {
         4444, 31337, 6667, 6660, 9999, 5555, 8877, 1337,
         1234, 4321, 6789, 9898, 9988, 2333, 2334,
     ]);
-}
-
-fn is_browser_related_process(process_name: &str) -> bool {
-    let lower = process_name.to_lowercase();
-    lower.contains("chrome") || 
-    lower.contains("firefox") || 
-    lower.contains("msedge") || 
-    lower.contains("opera") || 
-    lower.contains("brave") || 
-    lower.contains("safari")
 }

@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create event channels
     let (process_tx, process_rx) = crossbeam_channel::unbounded();
     let (network_tx, network_rx) = crossbeam_channel::unbounded();
-    let (alert_tx, _alert_rx) = crossbeam_channel::unbounded();
+    let (alert_tx, _) = crossbeam_channel::unbounded();
 
     // Load configuration
     let config = Arc::new(config::rules::load_rules());
@@ -47,7 +47,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let correlation_shutdown = Arc::new(AtomicBool::new(true));
     let process_shutdown = Arc::new(AtomicBool::new(true));
     let network_shutdown = Arc::new(AtomicBool::new(true));
-    let alert_shutdown = Arc::new(AtomicBool::new(true));
 
     // Start correlation engine
     let correlation_handle = correlation_engine::start_correlation_engine(
@@ -135,7 +134,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         process_shutdown,
         network_shutdown,
         correlation_shutdown,
-        alert_shutdown,
         process_tx,
         network_tx,
         alert_tx,
@@ -151,7 +149,6 @@ fn perform_shutdown(
     process_shutdown: Arc<AtomicBool>,
     network_shutdown: Arc<AtomicBool>,
     correlation_shutdown: Arc<AtomicBool>,
-    alert_shutdown: Arc<AtomicBool>,
     process_tx: crossbeam_channel::Sender<crate::events::BaseEvent>,
     network_tx: crossbeam_channel::Sender<crate::events::BaseEvent>,
     alert_tx: crossbeam_channel::Sender<crate::events::Alert>,
@@ -167,7 +164,6 @@ fn perform_shutdown(
     process_shutdown.store(false, Ordering::Relaxed);
     network_shutdown.store(false, Ordering::Relaxed);
     correlation_shutdown.store(false, Ordering::Relaxed);
-    alert_shutdown.store(false, Ordering::Relaxed);
 
     // Close channels to unblock threads
     drop(process_tx);

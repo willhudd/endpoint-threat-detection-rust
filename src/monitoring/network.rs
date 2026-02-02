@@ -101,7 +101,6 @@ fn should_log_connection(
                     timestamp: get_timestamp(),
                     dest_addr: daddr.to_string(),
                     dest_port: dport,
-                    network_type: network_type.to_string(),
                 });
                 return true;
             }
@@ -115,7 +114,6 @@ fn should_log_connection(
                     timestamp: get_timestamp(),
                     dest_addr: daddr.to_string(),
                     dest_port: dport,
-                    network_type: network_type.to_string(),
                 });
                 return true;
             }

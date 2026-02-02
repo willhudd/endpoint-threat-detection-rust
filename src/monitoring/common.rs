@@ -16,9 +16,6 @@ pub struct ProcessInfo {
     pub name: String,
     pub cached_at: u64,
     pub parent_pid: u32,
-    pub command_line: Option<String>,
-    pub is_scripting_engine: bool,
-    pub suspicious_flags: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -26,7 +23,6 @@ pub struct ConnectionAttempt {
     pub timestamp: u64,
     pub dest_addr: String,
     pub dest_port: u16,
-    pub network_type: String,
 }
 
 // Global storage
@@ -312,9 +308,6 @@ pub fn get_process_name_cached(pid: u32) -> String {
                 name: name.clone(),
                 cached_at: now,
                 parent_pid: 0,
-                command_line: None,
-                is_scripting_engine: false,
-                suspicious_flags: Vec::new(),
             });
         }
         if let Ok(mut recent) = RECENT_PROCESS_STARTS.lock() {
@@ -322,9 +315,6 @@ pub fn get_process_name_cached(pid: u32) -> String {
                 name: name.clone(),
                 cached_at: now,
                 parent_pid: 0,
-                command_line: None,
-                is_scripting_engine: false,
-                suspicious_flags: Vec::new(),
             });
         }
         return name;
@@ -362,9 +352,6 @@ pub fn cache_process_start(pid: u32, parent_pid: u32, process_name: &str, comman
         name: process_name.to_string(),
         cached_at: now,
         parent_pid,
-        command_line: command_line.clone(),
-        is_scripting_engine: is_scripting,
-        suspicious_flags: suspicious_flags.clone(),
     };
     
     // Store in BOTH caches immediately
