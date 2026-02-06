@@ -48,10 +48,10 @@ This is a **prototype endpoint detection system** written in Rust, implementing 
 
 The companion USB HID attack simulation tests this EDR's detection capabilities for:
 
-- **PowerShell execution chain detection**
-- **Suspicious process behavior correlation**
-- **Rapid network activity alerts**
-- **Persistence mechanism detection**
+- PowerShell execution chain detection
+- Suspicious process behavior correlation
+- Rapid network activity alerts
+- Persistence mechanism detection
 
 This EDR is specifically tuned to detect:
 - Scripting engine abuse (PowerShell, CScript, WScript)
