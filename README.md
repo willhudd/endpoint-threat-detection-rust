@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.png" alt="EDR System Banner" width="100%">
+  <img src="assets/banner.png" alt="HIDS System Banner" width="100%">
 </p>
 
 # Lightweight Endpoint Detection System - Rust
@@ -46,14 +46,14 @@ This is a **prototype endpoint detection system** written in Rust, implementing 
 
 👉 **Offensive USB Repository:**  [usb-keylogger-threat-emulation](https://github.com/willhudd/usb-keylogger-threat-emulation)
 
-The companion USB HID attack simulation tests this EDR's detection capabilities for:
+The companion USB attack simulation tests the HIDS's detection capabilities for:
 
 - PowerShell execution chain detection
 - Suspicious process behavior correlation
 - Rapid network activity alerts
 - Persistence mechanism detection
 
-This EDR is specifically tuned to detect:
+This HIDS is specifically tuned to detect:
 - Scripting engine abuse (PowerShell, CScript, WScript)
 - Living-off-the-land binaries (LOLBins)
 - Beaconing and command & control traffic
@@ -73,7 +73,7 @@ This EDR is specifically tuned to detect:
 ```bash
 # Clone the repository
 git clone https://github.com/willhudd/endpoint-threat-detection-rust.git
-cd rust-edr-system
+cd rust-hids
 
 # Build in release mode
 cargo build --release
