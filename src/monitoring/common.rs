@@ -16,9 +16,6 @@ pub struct ProcessInfo {
     pub name: String,
     pub cached_at: u64,
     pub parent_pid: u32,
-    pub command_line: Option<String>,
-    pub is_scripting_engine: bool,
-    pub suspicious_flags: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -26,7 +23,6 @@ pub struct ConnectionAttempt {
     pub timestamp: u64,
     pub dest_addr: String,
     pub dest_port: u16,
-    pub network_type: String,
 }
 
 // Global storage
@@ -40,7 +36,6 @@ lazy_static::lazy_static! {
     pub static ref DNS_CACHE: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
     pub static ref COMMAND_LINE_CACHE: Mutex<HashMap<u32, (String, u64)>> = Mutex::new(HashMap::new());
     pub static ref SCRIPTING_ENGINE_CACHE: Mutex<HashSet<u32>> = Mutex::new(HashSet::new());
-    pub static ref WEBHOOK_DOMAINS: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
 }
 
 // Common utility functions
@@ -205,14 +200,6 @@ pub fn cache_scripting_engine(pid: u32) {
     }
 }
 
-pub fn is_cached_scripting_engine(pid: u32) -> bool {
-    if let Ok(cache) = SCRIPTING_ENGINE_CACHE.lock() {
-        cache.contains(&pid)
-    } else {
-        false
-    }
-}
-
 fn get_command_line_powershell(pid: u32) -> Option<String> {
     use std::process::Command;
     
@@ -291,29 +278,6 @@ fn get_command_line_tasklist(pid: u32) -> Option<String> {
     }
 }
 
-pub fn does_process_exist(pid: u32) -> bool {
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
-    
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-        match handle {
-            Ok(h) => {
-                let _ = CloseHandle(h);
-                true
-            }
-            Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
-                // Invalid parameter usually means process doesn't exist
-                false
-            }
-            Err(_) => {
-                // Other error - process might exist but we can't access it
-                false
-            }
-        }
-    }
-}
-
 pub fn get_process_name_cached(pid: u32) -> String {
     let now = get_timestamp();
     
@@ -344,9 +308,6 @@ pub fn get_process_name_cached(pid: u32) -> String {
                 name: name.clone(),
                 cached_at: now,
                 parent_pid: 0,
-                command_line: None,
-                is_scripting_engine: false,
-                suspicious_flags: Vec::new(),
             });
         }
         if let Ok(mut recent) = RECENT_PROCESS_STARTS.lock() {
@@ -354,9 +315,6 @@ pub fn get_process_name_cached(pid: u32) -> String {
                 name: name.clone(),
                 cached_at: now,
                 parent_pid: 0,
-                command_line: None,
-                is_scripting_engine: false,
-                suspicious_flags: Vec::new(),
             });
         }
         return name;
@@ -394,9 +352,6 @@ pub fn cache_process_start(pid: u32, parent_pid: u32, process_name: &str, comman
         name: process_name.to_string(),
         cached_at: now,
         parent_pid,
-        command_line: command_line.clone(),
-        is_scripting_engine: is_scripting,
-        suspicious_flags: suspicious_flags.clone(),
     };
     
     // Store in BOTH caches immediately
@@ -463,12 +418,12 @@ pub fn is_browser_related_process(pid: u32, process_name: &str) -> bool {
     let lower = process_name.to_lowercase();
     
     // Main browser executables
-    let browsers = vec![
+    const BROWSERS: &[&str] = &[
         "chrome.exe", "firefox.exe", "msedge.exe", "opera.exe", 
         "brave.exe", "vivaldi.exe", "iexplore.exe", "edge.exe"
     ];
     
-    if browsers.iter().any(|&b| lower.contains(b)) {
+    if BROWSERS.iter().any(|&b| lower.contains(b)) {
         return true;
     }
     
@@ -501,13 +456,13 @@ pub fn create_connection_signature(pid: u32, saddr: &str, sport: u16, daddr: &st
 }
 
 pub fn is_common_short_lived_process(process_name: &str) -> bool {
-    let common_short_lived = vec![
+    const COMMON_SHORT_LIVED: &[&str] = &[
         "conhost.exe", "dllhost.exe", "runtimebroker.exe",
         "taskhostw.exe", "backgroundtaskhost.exe",
     ];
     
     let lower = process_name.to_lowercase();
-    common_short_lived.iter().any(|&name| lower.contains(name))
+    COMMON_SHORT_LIVED.iter().any(|&name| lower.contains(name))
 }
 
 pub fn cleanup_tracking_data() {
@@ -573,5 +528,152 @@ pub fn resolve_process_name(pid: u32) -> Option<String> {
                 .map(|s| s.to_string());
         }
         None
+    }
+}
+
+// Network classification utilities
+pub fn is_webhook_service(domain: &str) -> bool {
+    let lower_domain = domain.to_lowercase();
+    
+    lower_domain.contains("discord.com") ||
+    lower_domain.contains("webhook.office.com") ||
+    lower_domain.contains("hooks.slack.com") ||
+    lower_domain.contains("webhooks.mongodb-realm.com") ||
+    lower_domain.contains("webhook.site") ||
+    lower_domain.ends_with(".webhook.app")
+}
+
+pub fn is_suspicious_domain(domain: &str) -> bool {
+    let lower_domain = domain.to_lowercase();
+    
+    // Check for domain generation algorithm (DGA) patterns
+    if lower_domain.chars().filter(|c| c.is_ascii_digit()).count() > 5 {
+        return true;
+    }
+    
+    // Check for excessive subdomains
+    if lower_domain.matches('.').count() > 4 {
+        return true;
+    }
+    
+    // Check for suspicious TLDs
+    const SUSPICIOUS_TLDS: &[&str] = &[".xyz", ".top", ".club", ".bid", ".win", ".gq", ".ml", ".cf"];
+    if SUSPICIOUS_TLDS.iter().any(|tld| lower_domain.ends_with(tld)) {
+        return true;
+    }
+    
+    false
+}
+
+pub fn is_high_risk_port(port: u16) -> bool {
+    // Ports commonly associated with malware/C2
+    matches!(port, 
+        4444 | 31337 | 6667 | 6660 | 9999 | 5555 | 8877 | 1337 | 
+        1234 | 4321 | 6789 | 9898 | 9988 | 2333 | 2334
+    )
+}
+
+pub fn describe_port(port: u16) -> &'static str {
+    match port {
+        4444 => "Metasploit default",
+        31337 => "Back Orifice",
+        6667 => "IRC",
+        6660 => "IRC",
+        9999 => "Common malware",
+        5555 => "Common malware",
+        8877 => "Common malware",
+        1337 => "Elite/Leet port",
+        3389 => "RDP",
+        22 => "SSH",
+        23 => "Telnet",
+        21 => "FTP",
+        25 => "SMTP",
+        110 => "POP3",
+        143 => "IMAP",
+        445 => "SMB",
+        135 => "RPC",
+        _ => "Unknown",
+    }
+}
+
+// Process classification utilities
+pub fn is_system_process(process_name: &str) -> bool {
+    let lower = process_name.to_lowercase();
+    lower.contains("svchost.exe") ||
+    lower.contains("system") ||
+    lower.contains("csrss.exe") ||
+    lower.contains("wininit.exe") ||
+    lower.contains("services.exe") ||
+    lower.contains("lsass.exe") ||
+    lower.contains("winlogon.exe") ||
+    lower.contains("explorer.exe") ||
+    lower.contains("dwm.exe") ||
+    lower.contains("taskhostw.exe")
+}
+
+pub fn is_network_aware_process(process_name: &str) -> bool {
+    let lower = process_name.to_lowercase();
+    lower.contains("chrome.exe") ||
+    lower.contains("firefox.exe") ||
+    lower.contains("msedge.exe") ||
+    lower.contains("spotify.exe") ||
+    lower.contains("teams.exe") ||
+    lower.contains("slack.exe") ||
+    lower.contains("zoom.exe") ||
+    lower.contains("discord.exe") ||
+    lower.contains("outlook.exe") ||
+    lower.contains("thunderbird.exe")
+}
+
+pub fn categorize_process(process_name: &str) -> &'static str {
+    let lower = process_name.to_lowercase();
+    if lower.contains("powershell") || lower.contains("pwsh") {
+        "PowerShell"
+    } else if lower.contains("cmd.exe") {
+        "Command Prompt"
+    } else if lower.contains("wscript.exe") || lower.contains("cscript.exe") {
+        "Windows Script Host"
+    } else if lower.contains("mshta.exe") {
+        "HTML Application"
+    } else if lower.contains("regsvr32.exe") {
+        "DLL Registration"
+    } else if lower.contains("rundll32.exe") {
+        "DLL Execution"
+    } else if lower.contains("certutil.exe") {
+        "Certificate Utility"
+    } else if lower.contains("bitsadmin.exe") {
+        "Background Intelligent Transfer"
+    } else if lower.ends_with(".ps1") {
+        "PowerShell Script"
+    } else if lower.ends_with(".vbs") {
+        "VBScript"
+    } else if lower.ends_with(".js") {
+        "JavaScript"
+    } else if lower.ends_with(".hta") {
+        "HTML Application"
+    } else if lower.contains("chrome.exe") {
+        "Chrome Browser"
+    } else if lower.contains("firefox.exe") {
+        "Firefox Browser"
+    } else if lower.contains("msedge.exe") {
+        "Edge Browser"
+    } else if lower.contains("code.exe") {
+        "VS Code"
+    } else if lower.contains("spotify.exe") {
+        "Spotify"
+    } else if lower.contains("nvidia") {
+        "NVIDIA"
+    } else if lower.contains("searchhost.exe") {
+        "Windows Search"
+    } else {
+        "Application"
+    }
+}
+
+pub fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len])
     }
 }
