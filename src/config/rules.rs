@@ -8,7 +8,6 @@ pub struct Config {
     pub alert_rules: Vec<AlertRule>,
     pub trusted_processes: Vec<String>,
     pub suspicious_process_types: Vec<String>,
-    pub suspicious_ports: Vec<u16>,
     pub network_baselines: NetworkBaselines,
     pub alert_cooldowns: AlertCooldowns,
     pub known_malicious_iocs: Option<MaliciousIOCs>,
@@ -139,9 +138,6 @@ impl Default for Config {
                 "certutil.exe".to_string(),
                 "bitsadmin.exe".to_string(),
             ],
-            suspicious_ports: vec![
-                4444, 31337, 6667, 6660, 9999, 5555, 8877, 1337, 8080, 8443,
-            ],
             network_baselines: NetworkBaselines {
                 max_connections_per_minute: [
                     ("chrome.exe".to_string(), 100),
@@ -176,7 +172,7 @@ impl Default for Config {
                     "discord.com".to_string(), // Webhook service
                 ],
                 ports: vec![
-                    4444, 31337, 6667, 6660, 9999, 5555,
+                    4444, 31337, 6667, 6660, 9999, 5555, 8877, 1337, 8080, 8443, 1234, 4321, 6789, 9898, 9988, 2333, 2334,
                 ],
                 patterns: vec![
                     IoCPattern {

@@ -3,7 +3,7 @@ mod events;
 mod monitoring;
 mod utils;
 
-use crate::monitoring::{start_process_monitor, start_network_monitor, correlation_engine};
+use crate::monitoring::{start_process_monitor, start_network_monitor, start_correlation_engine};
 use crate::utils::privilege;
 use simplelog::*;
 use std::sync::Arc;
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let network_shutdown = Arc::new(AtomicBool::new(true));
 
     // Start correlation engine
-    let correlation_handle = correlation_engine::start_correlation_engine(
+    let correlation_handle = start_correlation_engine(
         process_rx,
         network_rx,
         alert_tx.clone(),
