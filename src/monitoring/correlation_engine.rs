@@ -70,6 +70,18 @@ struct AlertState {
     recent_events: VecDeque<(chrono::DateTime<chrono::Utc>, u32, String, String)>,
 }
 
+pub fn start_correlation_engine(
+    process_rx: Receiver<BaseEvent>,
+    network_rx: Receiver<BaseEvent>,
+    alert_tx: Sender<Alert>,
+    config: Arc<Config>,
+    shutdown: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        run_correlation_engine(process_rx, network_rx, alert_tx, config, shutdown);
+    })
+}
+
 pub fn run_correlation_engine(
     process_rx: Receiver<BaseEvent>,
     network_rx: Receiver<BaseEvent>,
@@ -158,32 +170,22 @@ fn handle_process_start(
     
     // CRITICAL: Get command line IMMEDIATELY on process start
     let command_line = get_command_line_cached(pid).unwrap_or_default();
-
-    let parent_info = get_parent_process_info(parent_pid);
-    let parent_name = parent_info.0;
-
-    // Analyze command line for suspicious indicators
+    let (parent_name, _) = get_parent_process_info(parent_pid);
     let suspicious_flags = analyze_command_line(process_name, &command_line);
-    
-    // Enhanced process classification
-    let is_known_good = is_known_good_process(process_name, &command_line);
-    let is_scripting_engine = is_scripting_engine(process_name, &command_line);
-
     let keylogger_score = calculate_keylogger_score(process_name, &command_line);
     
-    let context = ProcessContext {
+    process_contexts.insert(pid, ProcessContext {
         start_time: chrono::Utc::now(),
         process_name: process_name.clone(),
         pid,
         parent_pid,
-        parent_name: parent_name.clone(),
+        parent_name,
         command_line: command_line.clone(),
         first_network_event_time: None,
         network_connections: Vec::new(),
         last_alert_time: None,
-        alert_count: 0,
-        is_known_good,
-        is_scripting_engine,
+        is_known_good: is_known_good_process(process_name, &command_line),
+        is_scripting_engine: is_scripting_engine(process_name, &command_line),
         suspicious_flags: suspicious_flags.clone(),
         process_age_at_first_network: None,
     };
@@ -323,7 +325,6 @@ fn handle_network_connection(
             first_network_event_time: Some(chrono::Utc::now()),
             network_connections: Vec::new(),
             last_alert_time: None,
-            alert_count: 0,
             is_known_good,
             is_scripting_engine,
             suspicious_flags,
@@ -1172,7 +1173,8 @@ fn generate_alert(
     severity: crate::events::alert::AlertSeverity,
     rule_name: &str,
     description: &str,
-    context: &ProcessContext,
+    process_name: &str,
+    pid: u32,
     alert_tx: &Sender<Alert>,
     details: Vec<String>,
 ) {
@@ -1180,8 +1182,8 @@ fn generate_alert(
         &severity,
         rule_name,
         description,
-        &context.process_name,
-        context.pid,
+        process_name,
+        pid,
         &details,
     );
     
@@ -1195,14 +1197,15 @@ fn generate_alert(
         ║ Severity = {:?}\n\
         ║ Process  = {} (PID: {})\n\
         ║ Rule     = {}\n\
-        ║ Details  = {}\n\
+        ║ Details:\n\
+        {}\n\
         ╚══════════════════════════════════════════════",
         description,
         severity,
-        context.process_name,
-        context.pid,
+        process_name,
+        pid,
         rule_name,
-        details.join(", ")
+        details.iter().map(|d| format!("║   {}", d)).collect::<Vec<_>>().join("\n")
     );
 }
 
@@ -1266,10 +1269,4 @@ fn load_initial_iocs(alert_state: &mut AlertState, config: &Config) {
         alert_state.known_malicious_domains.extend(iocs.domains.iter().cloned());
         alert_state.known_malicious_ports.extend(iocs.ports.iter().cloned());
     }
-    
-    // Add common malicious ports
-    alert_state.known_malicious_ports.extend(vec![
-        4444, 31337, 6667, 6660, 9999, 5555, 8877, 1337,
-        1234, 4321, 6789, 9898, 9988, 2333, 2334,
-    ]);
 }
