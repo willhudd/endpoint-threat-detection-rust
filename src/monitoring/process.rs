@@ -33,16 +33,14 @@ pub fn run_process_monitor(
             *guard = Some(Arc::new(tx.clone()));
         }
 
-        let session_name = widestring::U16CString::from_str("HIDS_PROCESS_MONITOR").unwrap();
-
-        // Stop any existing session before starting a new one
+        // Stop any existing kernel logger session before starting a new one
         let mut stop_buffer = vec![0u8; std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 1024];
         let stop_props = stop_buffer.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
         (*stop_props).Wnode.BufferSize = stop_buffer.len() as u32;
         (*stop_props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
         let stop_result = ControlTraceW(
             CONTROLTRACE_HANDLE::default(),
-            PWSTR(session_name.as_ptr() as *mut u16),
+            KERNEL_LOGGER_NAMEW,
             stop_props,
             EVENT_TRACE_CONTROL_STOP,
         );
@@ -63,7 +61,7 @@ pub fn run_process_monitor(
         let mut session_handle = CONTROLTRACE_HANDLE::default();
         let status = StartTraceW(
             &mut session_handle,
-            PWSTR(session_name.as_ptr() as *mut u16),
+            KERNEL_LOGGER_NAMEW,
             props,
         );
 
@@ -81,7 +79,7 @@ pub fn run_process_monitor(
         log::info!("✅ Process Monitor session started");
 
         let mut logfile: EVENT_TRACE_LOGFILEW = std::mem::zeroed();
-        logfile.LoggerName = PWSTR(session_name.as_ptr() as *mut u16);
+        logfile.LoggerName = PWSTR(KERNEL_LOGGER_NAMEW.as_ptr() as *mut u16);
         logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
 
         unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
@@ -133,7 +131,7 @@ pub fn run_process_monitor(
                         log_process_event(
                             &process_name,
                             pid,
-                            "Process Ended"
+                            "Process Ended",
                         );
                     }
 
@@ -158,7 +156,7 @@ pub fn run_process_monitor(
             log::error!("Process Monitor OpenTraceW Failed");
             let _ = ControlTraceW(
                 session_handle,
-                PWSTR(session_name.as_ptr() as *mut u16),
+                KERNEL_LOGGER_NAMEW,
                 props,
                 EVENT_TRACE_CONTROL_STOP,
             );
@@ -186,7 +184,7 @@ pub fn run_process_monitor(
         let _ = CloseTrace(trace_handle);
         let _ = ControlTraceW(
             session_handle,
-            PWSTR(session_name.as_ptr() as *mut u16),
+            KERNEL_LOGGER_NAMEW,
             props,
             EVENT_TRACE_CONTROL_STOP,
         );
