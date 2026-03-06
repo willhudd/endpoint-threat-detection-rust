@@ -1,6 +1,13 @@
 use crate::config::rules::Config;
 use crate::events::{Alert, BaseEvent, EventType};
-use crate::utils::common::{get_command_line_cached, get_parent_process_info, analyze_command_line, is_suspicious_domain, is_high_risk_port, describe_port, is_network_aware_process, is_scripting_engine, truncate_string};
+use crate::utils::common::{
+    get_command_line_cached, get_parent_process_info,
+    analyze_command_line, is_suspicious_domain,
+    is_high_risk_port, describe_port,
+    is_network_aware_process, is_scripting_engine,
+    is_known_good_process, is_suspicious_parent_process,
+    identify_lolbas_abuse, is_private_or_local, truncate_string,
+};
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -94,10 +101,10 @@ pub fn run_correlation_engine(
         recent_events: VecDeque::with_capacity(1000),
         dns_webhook_observations: HashMap::new(),
     };
-    
+
     // Load initial IOCs from config
     load_initial_iocs(&mut alert_state, &config);
-    
+
     while shutdown.load(Ordering::Relaxed) {
         crossbeam_channel::select! {
             recv(process_rx) -> event => {
@@ -137,7 +144,7 @@ fn process_event(
         process_name,
         format!("{:?}", event.event_type)
     ));
-    
+
     match &event.event_type {
         EventType::ProcessStart(process_event) => {
             handle_process_start(process_event, process_contexts, alert_state, alert_tx);
@@ -188,8 +195,7 @@ fn handle_process_start(
     // Get command line immediately — it may disappear when the process exits.
     let command_line = get_command_line_cached(pid).unwrap_or_default();
     let (parent_name, _) = get_parent_process_info(parent_pid);
-    let suspicious_flags = analyze_command_line(process_name, &command_line);
-    let keylogger_score = calculate_keylogger_score(process_name, &command_line);
+    let cmd_analysis = analyze_command_line(&command_line);
 
     process_contexts.insert(pid, ProcessContext {
         start_time: chrono::Utc::now(),
@@ -203,7 +209,7 @@ fn handle_process_start(
         last_alert_time: None,
         is_known_good: is_known_good_process(process_name, &command_line),
         is_scripting_engine: is_scripting_engine(process_name, &command_line),
-        suspicious_flags: suspicious_flags.clone(),
+        suspicious_flags: cmd_analysis.flags.clone(),
         process_age_at_first_network: None,
         suspicion_score: 0,
         alert_reasons: Vec::new(),
@@ -215,7 +221,7 @@ fn handle_process_start(
     let context = process_contexts.get_mut(&pid).unwrap();
 
     // Score each suspicious command-line flag
-    for flag in &suspicious_flags {
+    for flag in &cmd_analysis.flags {
         context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG;
         context.alert_reasons.push(format!("Suspicious flag: {}", flag));
         log::info!(
@@ -224,39 +230,30 @@ fn handle_process_start(
         );
     }
 
-    // Apply keylogger score
-    if keylogger_score >= 3 {
+    // Apply behavioural score
+    if cmd_analysis.cmd_score >= 3 {
         let added = WEIGHT_KEYLOGGER_API * 2;
         context.suspicion_score += added;
         context.alert_reasons.push(format!(
-            "Keylogging API indicators (score {}/5)", keylogger_score
+            "Keylogging / stager API indicators (score {}/5)", cmd_analysis.cmd_score
         ));
         log::warn!(
-            "🔑 [process_start +{}] High-confidence keylogger indicators for '{}' (PID: {})",
+            "🔑 [process_start +{}] High-confidence PS indicators for '{}' (PID: {})",
             added, process_name, pid
         );
-    } else if keylogger_score >= 1 {
+    } else if cmd_analysis.cmd_score >= 1 {
         context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG;
         context.alert_reasons.push(format!(
-            "Suspicious PowerShell invocation flags (keylogger score {}/5)", keylogger_score
+            "Suspicious PowerShell invocation flags (score {}/5)", cmd_analysis.cmd_score
         ));
         log::info!(
-            "🟡 [process_start +{}] Low-confidence keylogger flags for '{}' (PID: {})",
+            "🟡 [process_start +{}] Low-confidence PS flags for '{}' (PID: {})",
             WEIGHT_SUSPICIOUS_FLAG, process_name, pid
         );
     }
 
-    check_webhook_exfiltration(
-        context,
-        "",
-        0,
-        None,
-        alert_state
-    );
-
     // Check for LOLBAS abuse patterns
-    if is_lolbas_pattern(process_name, &command_line) {
-        let pattern = identify_lolbas_pattern(&command_line);
+    if let Some(pattern) = identify_lolbas_abuse(process_name, &command_line) {
         context.suspicion_score += WEIGHT_LOLBAS;
         context.alert_reasons.push(format!("LOLBAS pattern: {}", pattern));
         log::warn!(
@@ -506,26 +503,16 @@ fn handle_network_connection(
         }
     }
 
-    // Skip if we've already marked this process as verified (but re-evaluate if suspicious)
-    if alert_state.verified_processes.contains(&pid) {
-        // Still check for highly suspicious connections even from "verified" processes
-        if !is_highly_suspicious_connection(network_event) {
-            return;
-        }
-    }
-    
     // Get or create process context
     let context = if let Some(ctx) = process_contexts.get_mut(&pid) {
         ctx
     } else {
-        
         let command_line = get_command_line_cached(pid).unwrap_or_default();
         let is_known_good = is_known_good_process(process_name, &command_line);
         let is_scripting_engine = is_scripting_engine(process_name, &command_line);
-        let suspicious_flags = analyze_command_line(process_name, &command_line);
-        
+        let cmd_analysis = analyze_command_line(&command_line);
         let ctx = ProcessContext {
-            start_time: chrono::Utc::now(), // Approximate
+            start_time: chrono::Utc::now(),
             process_name: process_name.clone(),
             pid,
             parent_pid: 0,
@@ -536,32 +523,31 @@ fn handle_network_connection(
             last_alert_time: None,
             is_known_good,
             is_scripting_engine,
-            suspicious_flags,
+            suspicious_flags: cmd_analysis.flags.clone(),
             process_age_at_first_network: None,
             suspicion_score: 0,
             alert_reasons: Vec::new(),
             alerted: false,
             webhook_alerted: false,
         };
-        
+
         process_contexts.insert(pid, ctx);
         process_contexts.get_mut(&pid).unwrap()
     };
-    
+
     // Update first network event time if not set
     if context.first_network_event_time.is_none() {
         context.first_network_event_time = Some(chrono::Utc::now());
         let time_delta = chrono::Utc::now() - context.start_time;
         context.process_age_at_first_network = time_delta.to_std().ok();
     }
-    
+
     // Classify connection
     let is_private_destination = is_private_or_local(&network_event.remote_address);
     let is_external = !is_private_destination && network_event.remote_address != "0.0.0.0";
-    
-    // Try to resolve domain if available
+
     let remote_domain = network_event.domain.clone();
-    
+
     let connection = NetworkConnection {
         timestamp: chrono::Utc::now(),
         protocol: match &network_event.protocol {
@@ -576,9 +562,9 @@ fn handle_network_connection(
         is_external,
         data_size: network_event.data_size,
     };
-    
+
     context.network_connections.push(connection.clone());
-    
+
     // Run detection functions in order of importance
     // 1. Check for webhook exfiltration (highest priority for scripting engines)
     check_webhook_exfiltration(
@@ -588,153 +574,18 @@ fn handle_network_connection(
         network_event.domain.as_deref(),
         alert_state,
     );
-    
+
     // 2. Check for immediate threats (IOCs, malicious IPs/domains, high-risk ports)
     check_immediate_threats(&connection, context, alert_state);
-    
+
     // 3. Evaluate network behavior patterns
     evaluate_network_alert(context, &connection, alert_state);
-    
+
     // 4. Check if we've reached the threshold to alert
     maybe_alert(context, alert_tx);
-    
+
     // Mark as evaluated to prevent repeated processing
     alert_state.evaluated_processes.insert(pid);
-}
-
-/// The score feeds into the process suspicion score; it is not itself the threshold.
-/// TODO: REDO THIS FUNCTION
-fn calculate_keylogger_score(process_name: &str, command_line: &str) -> u8 {
-    let lower_name = process_name.to_lowercase();
-    if !lower_name.contains("powershell") && !lower_name.contains("pwsh") {
-        return 0;
-    }
-
-    let lower_cmd = command_line.to_lowercase();
-    let mut score = 0u8;
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // TIER 1 — Invocation flag combinations
-    // Score the *how*, not the *what*.  Works with -File, -Command, -Encoded.
-    // ══════════════════════════════════════════════════════════════════════════
-
-    let has_bypass  = lower_cmd.contains("-executionpolicy bypass") || lower_cmd.contains("-ep bypass");
-    let has_hidden  = lower_cmd.contains("-windowstyle hidden") || lower_cmd.contains("-w hidden");
-    let has_noprof  = lower_cmd.contains("-noprofile") || lower_cmd.contains("-nop");
-    let has_nointer = lower_cmd.contains("-noninteractive") || lower_cmd.contains("-noni");
-    let has_encoded = lower_cmd.contains("-encodedcommand") || lower_cmd.contains("-enc ");
-    let has_file    = lower_cmd.contains(" -file ") || lower_cmd.contains(" -f ");
-
-    if has_bypass  { score = score.saturating_add(1); log::info!("🟡 [KLScore +1] -ExecutionPolicy Bypass"); }
-    if has_hidden  { score = score.saturating_add(1); log::info!("🟡 [KLScore +1] -WindowStyle Hidden"); }
-    if has_noprof  { score = score.saturating_add(1); log::info!("🟡 [KLScore +1] -NoProfile"); }
-
-    // -NonInteractive + -WindowStyle Hidden = fully headless, common in stagers
-    if has_nointer && has_hidden {
-        score = score.saturating_add(1);
-        log::info!("🟡 [KLScore +1] -NonInteractive + -WindowStyle Hidden combo");
-    }
-
-    // -EncodedCommand = base64 payload, strong obfuscation signal
-    if has_encoded {
-        score = score.saturating_add(2);
-        log::warn!("🟠 [KLScore +2] -EncodedCommand (base64 payload)");
-    }
-
-    // Evasion trifecta: Bypass + Hidden + NoProfile
-    if has_bypass && has_hidden && has_noprof {
-        score = score.saturating_add(2);
-        log::warn!("🟠 [KLScore +2] Evasion trifecta: Bypass + Hidden + NoProfile");
-    }
-
-    // Covert file delivery: Bypass + Hidden + -File
-    if has_bypass && has_hidden && has_file {
-        score = score.saturating_add(1);
-        log::warn!("🟡 [KLScore +1] Covert file delivery: Bypass + Hidden + -File");
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // TIER 2 — Obfuscation patterns
-    // ══════════════════════════════════════════════════════════════════════════
-
-    if lower_cmd.contains("frombase64string") {
-        score = score.saturating_add(2);
-        log::warn!("🟠 [KLScore +2] [Convert]::FromBase64String");
-    }
-    if lower_cmd.contains("iex") || lower_cmd.contains("invoke-expression") {
-        score = score.saturating_add(1);
-        log::warn!("🟡 [KLScore +1] Invoke-Expression / IEX");
-    }
-    if lower_cmd.contains("-join") || lower_cmd.contains("`") {
-        score = score.saturating_add(1);
-        log::info!("🟡 [KLScore +1] String obfuscation (-join / backtick)");
-    }
-    if lower_cmd.contains("[char]") {
-        score = score.saturating_add(1);
-        log::info!("🟡 [KLScore +1] [char] assembly obfuscation");
-    }
-    if lower_cmd.contains("downloadstring") || lower_cmd.contains("downloadfile")
-        || lower_cmd.contains("net.webclient")
-    {
-        score = score.saturating_add(1);
-        log::warn!("🟡 [KLScore +1] Download-cradle (WebClient / DownloadString)");
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // TIER 3 — Inline payload artefacts (smoking-gun if present)
-    // Only visible when payload is in -Command or -EncodedCommand.
-    // ══════════════════════════════════════════════════════════════════════════
-
-    if lower_cmd.contains("getasynckeystate") {
-        score = score.saturating_add(3);
-        log::warn!("🔴 [KLScore +3] GetAsyncKeyState Win32 API");
-    }
-    if lower_cmd.contains("getkeystate") {
-        score = score.saturating_add(3);
-        log::warn!("🔴 [KLScore +3] GetKeyState Win32 API");
-    }
-    if lower_cmd.contains("setwindowshookex") || lower_cmd.contains("setkeyboardhook") {
-        score = score.saturating_add(3);
-        log::warn!("🔴 [KLScore +3] SetWindowsHookEx / SetKeyboardHook");
-    }
-    if lower_cmd.contains("dllimport") && lower_cmd.contains("user32.dll") {
-        score = score.saturating_add(3);
-        log::warn!("🔴 [KLScore +3] user32.dll P/Invoke DllImport");
-    }
-    if lower_cmd.contains("system.runtime.interopservices") {
-        score = score.saturating_add(2);
-        log::warn!("🟠 [KLScore +2] System.Runtime.InteropServices (P/Invoke)");
-    }
-    if lower_cmd.contains("add-type") && lower_cmd.contains("system.windows.forms") {
-        score = score.saturating_add(2);
-        log::warn!("🟠 [KLScore +2] Add-Type System.Windows.Forms (key capture)");
-    }
-    // Special-key logging tokens
-    const SPECIAL_KEYS: &[&str] = &["[backspace]","[enter]","[tab]","[shift]","[ctrl]","[alt]"];
-    let sk_count = SPECIAL_KEYS.iter().filter(|&&k| lower_cmd.contains(k)).count();
-    if sk_count >= 2 {
-        score = score.saturating_add(2);
-        log::warn!("🟠 [KLScore +2] {} special-key logging tokens", sk_count);
-    }
-    if lower_cmd.contains("currentversion\\run") || lower_cmd.contains("currentversion/run") {
-        score = score.saturating_add(2);
-        log::warn!("🟠 [KLScore +2] Registry Run-key persistence");
-    }
-    if (lower_cmd.contains("while ($true)") || lower_cmd.contains("while (1)"))
-        && lower_cmd.contains("start-sleep")
-    {
-        score = score.saturating_add(2);
-        log::warn!("🟠 [KLScore +2] Infinite polling loop (while + Start-Sleep)");
-    }
-    if lower_cmd.contains("$env:appdata") && lower_cmd.contains(".txt") {
-        score = score.saturating_add(1);
-        log::info!("🟡 [KLScore +1] AppData .txt log-file reference");
-    }
-
-    if score > 0 {
-        log::warn!("📊 [KLScore] TOTAL for '{}': {}/5 threshold", process_name, score);
-    }
-    score
 }
 
 fn identify_webhook_service_by_domain(domain: &str) -> Option<&'static str> {
@@ -778,20 +629,16 @@ fn identify_webhook_service_by_ip(ip: &str) -> Option<&'static str> {
         return Some("Discord (own ASN 36459, 66.22.x.x)");
     }
 
-    // ── Azure Front Door / Azure CDN (Discord webhook delivery in some regions) ─
-    // 52.191.x.x — Azure East US (seen in live captures of Discord webhook exfil)
+    // ── Azure Front Door / Azure CDN ─────────────────────────────────────────
     if ip.starts_with("52.191.") {
         return Some("Discord webhook via Azure CDN East US (52.191.x.x)");
     }
-    // 20.49.x.x — Azure Front Door global PoP
     if ip.starts_with("20.49.") {
         return Some("Webhook via Azure Front Door (20.49.x.x)");
     }
-    // 20.42.x.x — Azure Front Door
     if ip.starts_with("20.42.") {
         return Some("Webhook via Azure Front Door (20.42.x.x)");
     }
-    // 20.150.x.x and 20.60.x.x — Azure CDN
     if ip.starts_with("20.150.") || ip.starts_with("20.60.") {
         return Some("Webhook via Azure CDN (20.150/60.x.x)");
     }
@@ -824,10 +671,6 @@ fn check_webhook_exfiltration(
     remote_domain: Option<&str>,
     alert_state: &AlertState,
 ) {
-    let lower_name = context.process_name.to_lowercase();
-    if !lower_name.contains("powershell") && !lower_name.contains("pwsh") {
-        return;
-    }
 
     let lower_cmd = context.command_line.to_lowercase();
 
@@ -841,7 +684,7 @@ fn check_webhook_exfiltration(
         || lower_cmd.contains("webhook.office.com")
         || lower_cmd.contains("webhook.site")
         || lower_cmd.contains("hooks.zapier.com")
-        || lower_cmd.contains("ntfy.sh")                         // common lightweight exfil
+        || lower_cmd.contains("ntfy.sh")
         || (lower_cmd.contains("invoke-webrequest")  && lower_cmd.contains("webhook"))
         || (lower_cmd.contains("invoke-restmethod")  && lower_cmd.contains("webhook"))
         || (lower_cmd.contains("irm ")               && lower_cmd.contains("webhook"))
@@ -856,10 +699,6 @@ fn check_webhook_exfiltration(
             "🚨 [Webhook +{}] Inline webhook indicator for '{}' (PID: {}) score→{}",
             WEIGHT_WEBHOOK, context.process_name, context.pid, context.suspicion_score
         );
-    }
-
-    if remote_port == 0 {
-        return;
     }
 
     // ── Path A: Domain resolved and it is a known webhook service ────────────
@@ -913,6 +752,13 @@ fn check_webhook_exfiltration(
     // ── Path C: IP-range heuristics ──────────────────────────────────────────
     // Last resort when DNS hasn't been correlated yet.  Only fires for TCP/443.
     if remote_port == 443 {
+        let already_suspicious = !context.suspicious_flags.is_empty()
+            || context.is_scripting_engine
+            || context.suspicion_score > 0;
+
+        if !already_suspicious {
+            return;
+        }
         if let Some(service) = identify_webhook_service_by_ip(remote_addr) {
             if !already_webhook_scored {
                 context.suspicion_score += WEIGHT_WEBHOOK;
@@ -968,9 +814,9 @@ fn check_immediate_threats(
 
     if let Some(domain) = &connection.remote_domain {
         if alert_state.known_malicious_domains.contains(domain) {
-            context.suspicion_score += WEIGHT_MALICIOUS_IP;
+            context.suspicion_score += WEIGHT_SUSPICIOUS_DOMAIN;
             context.alert_reasons.push(format!("Connection to known malicious domain: {}", domain));
-            log::warn!("⚠️ MALICIOUS DOMAIN: {} (Score: +{})", domain, WEIGHT_MALICIOUS_IP);
+            log::warn!("⚠️ MALICIOUS DOMAIN: {} (Score: +{})", domain, WEIGHT_SUSPICIOUS_DOMAIN);
         } else if is_suspicious_domain(domain) {
             context.suspicion_score += WEIGHT_SUSPICIOUS_DOMAIN;
             context.alert_reasons.push(format!("Connection to suspicious domain: {}", domain));
@@ -1005,21 +851,19 @@ fn evaluate_network_alert(
     alert_state: &mut AlertState,
 ) {
     let now = chrono::Utc::now();
-    
+
     // Don't evaluate non-external connections for non-scripting processes
     if !connection.is_external && !context.is_scripting_engine {
         return;
     }
-    
+
     // Calculate actual process age for correlation
     let process_age = if let Some(first_network_time) = context.first_network_event_time {
         now - first_network_time
     } else {
         now - context.start_time
     };
-    
-    // ========= DETECTION RULES ==========
-    
+
     // ── Rule 1: Scripting engine obfuscation ────────────────────────────────
     if context.is_scripting_engine && connection.is_external {
         let lower_cmd = context.command_line.to_lowercase();
@@ -1028,32 +872,31 @@ fn evaluate_network_alert(
             context.alert_reasons.push("PowerShell obfuscation patterns detected".to_string());
         }
     }
-    
+
     // Rule 2: Unexpected process making multiple rapid connections (possible scanning)
     if context.network_connections.len() >= 5 {
         let connections_last_10s = context.network_connections
             .iter()
             .filter(|c| now - c.timestamp < chrono::Duration::seconds(10))
             .count();
-        
+
         if connections_last_10s >= 5 {
-            // Check if this is normal for this process type
             let is_normal = match context.process_name.to_lowercase().as_str() {
                 name if name.contains("chrome") => connections_last_10s < 50,
                 name if name.contains("firefox") => connections_last_10s < 30,
                 name if name.contains("msedge") => connections_last_10s < 50,
                 _ => connections_last_10s < 10  // Stricter for non-browsers
             };
-            
+
             if !is_normal {
                 context.suspicion_score += WEIGHT_RAPID_CONNECTIONS;
                 context.alert_reasons.push(format!("Rapid connections: {} in 10 seconds", connections_last_10s));
-                log::warn!("⚡ RAPID CONNECTIONS: {} in 10s by {} (Score: +{})", 
+                log::warn!("⚡ RAPID CONNECTIONS: {} in 10s by {} (Score: +{})",
                     connections_last_10s, context.process_name, WEIGHT_RAPID_CONNECTIONS);
             }
         }
     }
-    
+
     // Rule 3: Process starts and immediately makes an external connection.
     // Loopback and LAN IPC are normal — only external destinations are suspicious here.
     if connection.is_external
@@ -1082,31 +925,29 @@ fn evaluate_network_alert(
                 connection.remote_addr, connection.remote_port, immediate_risk_score, WEIGHT_IMMEDIATE_C2);
         }
     }
-    
+
     // Rule 4: DNS over HTTPS/QUIC pattern (common in C2)
     if connection.protocol == "QUIC" {
         if context.is_scripting_engine {
             context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG;
             context.alert_reasons.push("Scripting engine using QUIC/HTTP3 protocol".to_string());
-            log::warn!("🌐 SCRIPT USING QUIC: {} (Score: +{})", 
+            log::warn!("🌐 SCRIPT USING QUIC: {} (Score: +{})",
                 context.process_name, WEIGHT_SUSPICIOUS_FLAG);
         } else if !is_network_aware_process(&context.process_name) {
-            // Non-network process using QUIC is suspicious
             context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG;
             context.alert_reasons.push("Non-network process using QUIC protocol".to_string());
         }
     }
-    
+
     // Rule 5: Re-analyze command line flags if we missed them at process-start time.
     // Guard with a flag to prevent double-counting on every subsequent network event.
     if context.suspicious_flags.is_empty() && context.is_scripting_engine {
-        let new_flags = analyze_command_line(&context.process_name, &context.command_line);
+        let new_flags = analyze_command_line(&context.command_line).flags;
         if !new_flags.is_empty() {
             log::info!(
                 "🔍 [Rule5] Late command-line analysis found {} new flags for '{}' (PID: {}): {:?}",
                 new_flags.len(), context.process_name, context.pid, new_flags
             );
-            // Populate suspicious_flags so this block never runs again for this process
             context.suspicious_flags = new_flags.clone();
             for flag in &new_flags {
                 context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG;
@@ -1118,18 +959,16 @@ fn evaluate_network_alert(
             }
         }
     }
-    
+
     // Rule 6: Connection pattern analysis
     if context.network_connections.len() >= 3 {
-        // Check if all connections are to the same IP/domain (possible beaconing)
         let first_remote = &context.network_connections[0].remote_addr;
         let same_target_count = context.network_connections
             .iter()
             .filter(|c| &c.remote_addr == first_remote)
             .count();
-        
+
         if same_target_count >= 3 && context.network_connections.len() <= 5 {
-            // Initial connections all to same target - possible C2 beacon
             if !is_known_good_process(&context.process_name, &context.command_line) {
                 context.suspicion_score += WEIGHT_RAPID_CONNECTIONS;
                 context.alert_reasons.push(format!("Beaconing pattern: {} connections to same target", same_target_count));
@@ -1137,136 +976,9 @@ fn evaluate_network_alert(
             }
         }
     }
-    
+
     // Mark as evaluated
     alert_state.evaluated_processes.insert(context.pid);
-}
-
-fn is_known_good_process(process_name: &str, command_line: &str) -> bool {
-    const KNOWN_GOOD: &[&str] = &[
-        // Browsers
-        "chrome.exe", "firefox.exe", "msedge.exe", "opera.exe", "brave.exe",
-        // Development tools
-        "code.exe", "devenv.exe", "intellij.exe", "pycharm.exe", "webstorm.exe",
-        // Communication
-        "teams.exe", "slack.exe", "discord.exe", "zoom.exe", "skype.exe",
-        // Cloud storage
-        "onedrive.exe", "dropbox.exe", "googledrivesync.exe",
-        // Music/Media
-        "spotify.exe", "vlc.exe", "itunes.exe",
-        // Gaming
-        "steam.exe", "epicgameslauncher.exe", "battle.net.exe",
-        // NVIDIA
-        "nvidia overlay.exe", "nvsphelper64.exe",
-        // Windows components
-        "searchhost.exe", "backgroundtaskhost.exe", "runtimebroker.exe",
-        // Creative / Office
-        "adobe creative cloud.exe", "creative cloud.exe", "ccxprocess.exe",
-        "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe",
-    ];
-    const LEGIT_PS_PATTERNS: &[&str] = &[
-        "get-process", "get-service", "get-eventlog", "import-module",
-        "update-help", "get-help", "get-command", "start-service",
-        "stop-service", "restart-service", "get-wmiobject", "get-ciminstance",
-    ];
-
-    let lower_name = process_name.to_lowercase();
-    let lower_cmd = command_line.to_lowercase();
-
-    if KNOWN_GOOD.iter().any(|&p| lower_name.contains(p)) {
-        return true;
-    }
-
-    // PowerShell running common admin commands is considered known-good
-    if lower_name.contains("powershell.exe") {
-        if LEGIT_PS_PATTERNS.iter().any(|&p| lower_cmd.contains(p)) {
-            return true;
-        }
-    }
-    false
-}
-
-fn is_lolbas_pattern(process_name: &str, command_line: &str) -> bool {
-    let lower_name = process_name.to_lowercase();
-    let lower_cmd = command_line.to_lowercase();
-    
-    match lower_name.as_str() {
-        "rundll32.exe" => {
-            lower_cmd.contains(".dll,") && 
-            (lower_cmd.contains("http://") || lower_cmd.contains("https://") ||
-             lower_cmd.contains("regsvr") || lower_cmd.contains("javascript:"))
-        }
-        "regsvr32.exe" => {
-            lower_cmd.contains("/s") && 
-            (lower_cmd.contains("http://") || lower_cmd.contains("https://") ||
-             lower_cmd.contains(".sct") || lower_cmd.contains(".scrobj"))
-        }
-        "mshta.exe" => {
-            lower_cmd.contains("http://") || lower_cmd.contains("https://") ||
-            lower_cmd.contains("javascript:") || lower_cmd.contains("vbscript:")
-        }
-        "certutil.exe" => {
-            lower_cmd.contains("-urlcache") || lower_cmd.contains("-split") ||
-            lower_cmd.contains("-decode") || lower_cmd.contains("-encode")
-        }
-        "bitsadmin.exe" => {
-            lower_cmd.contains("/transfer") || lower_cmd.contains("/create") ||
-            lower_cmd.contains("/addfile") || lower_cmd.contains("/setnotifycmdline")
-        }
-        "wmic.exe" => {
-            lower_cmd.contains("process call create") ||
-            lower_cmd.contains("/node:") && lower_cmd.contains("process create")
-        }
-        _ => false
-    }
-}
-
-fn identify_lolbas_pattern(command_line: &str) -> &'static str {
-    let lower_cmd = command_line.to_lowercase();
-    
-    if lower_cmd.contains("rundll32.exe") && lower_cmd.contains("javascript:") {
-        "Rundll32 JavaScript Execution"
-    } else if lower_cmd.contains("regsvr32.exe") && lower_cmd.contains(".sct") {
-        "Regsvr32 SCT Scriptlet Execution"
-    } else if lower_cmd.contains("mshta.exe") && (lower_cmd.contains("http://") || lower_cmd.contains("https://")) {
-        "Mshta Remote Script Execution"
-    } else if lower_cmd.contains("certutil.exe") && lower_cmd.contains("-urlcache") {
-        "Certutil File Download"
-    } else if lower_cmd.contains("bitsadmin.exe") && lower_cmd.contains("/transfer") {
-        "Bitsadmin File Transfer"
-    } else if lower_cmd.contains("wmic.exe") && lower_cmd.contains("process call create") {
-        "WMIC Remote Process Creation"
-    } else {
-        "Unknown LOLBAS Pattern"
-    }
-}
-
-fn is_highly_suspicious_connection(network_event: &crate::events::network::NetworkEvent) -> bool {
-    // Even "verified" processes can do suspicious things
-    is_high_risk_port(network_event.remote_port) ||
-    network_event.remote_address.starts_with("192.168.56.") && network_event.process_name.to_lowercase().contains("powershell")
-}
-
-fn is_suspicious_parent_process(child_name: &str, parent_name: &str) -> bool {
-    let child_lower = child_name.to_lowercase();
-    let parent_lower = parent_name.to_lowercase();
-
-    // Suspicious parent-child combinations
-    // PowerShell spawning PowerShell is the canonical spawn-and-exit evasion pattern.
-    (parent_lower.contains("powershell") && child_lower.contains("powershell")) ||
-    (parent_lower.contains("pwsh") && child_lower.contains("powershell")) ||
-    (parent_lower.contains("powershell") && child_lower.contains("pwsh")) ||
-    // Scripts/documents spawning shells
-    (parent_lower.contains("explorer.exe") && child_lower.contains("powershell.exe")) ||
-    (parent_lower.contains("svchost.exe") && child_lower.contains("cmd.exe")) ||
-    (parent_lower.contains("services.exe") && child_lower.contains("wscript.exe")) ||
-    (parent_lower.contains("winword.exe") && child_lower.contains("powershell.exe")) ||
-    (parent_lower.contains("excel.exe") && child_lower.contains("cmd.exe")) ||
-    (parent_lower.contains("outlook.exe") && child_lower.contains("powershell.exe")) ||
-    // cmd/wscript spawning powershell
-    (parent_lower.contains("cmd.exe") && child_lower.contains("powershell.exe")) ||
-    (parent_lower.contains("wscript.exe") && child_lower.contains("powershell.exe")) ||
-    (parent_lower.contains("cscript.exe") && child_lower.contains("powershell.exe"))
 }
 
 fn check_temporal_correlations(
@@ -1320,13 +1032,6 @@ fn check_temporal_correlations(
     }
 
     // ── Check 2: evasion-flagged scripting engine with no alerted parent ─────
-    // Safety-net for the spawn-and-exit pattern. By the time this runs (every
-    // 100 ms), the parent may already be gone from process_contexts. We score
-    // any scripting engine that:
-    //   • started ≤ 10 s ago
-    //   • carries -WindowStyle Hidden AND -ExecutionPolicy Bypass
-    //   • hasn't been alerted yet
-    //   • whose parent PID is NOT present in process_contexts (already exited)
     let living_pids: HashSet<u32> = process_contexts.keys().copied().collect();
 
     let evasion_candidates: Vec<u32> = process_contexts
@@ -1376,21 +1081,20 @@ fn check_temporal_correlations(
 
 fn should_alert(alert_key: &str, alert_state: &mut AlertState, cooldown: Duration) -> bool {
     let now = chrono::Utc::now();
-    
+
     if let Some(last_alert) = alert_state.recent_alerts.get(alert_key) {
         if now - *last_alert < chrono::Duration::from_std(cooldown).unwrap() {
             return false; // Still in cooldown
         }
     }
-    
-    // Update last alert time
+
     alert_state.recent_alerts.insert(alert_key.to_string(), now);
-    
+
     // Clean up old alerts (keep for 24 hours)
     alert_state.recent_alerts.retain(|_, time| {
         now - *time < chrono::Duration::hours(24)
     });
-    
+
     true
 }
 
@@ -1574,53 +1278,33 @@ fn generate_alert(
     );
 }
 
-fn is_private_or_local(addr: &str) -> bool {
-    addr.starts_with("127.") ||
-    addr.starts_with("10.") ||
-    (addr.starts_with("172.") && {
-        if let Some(dot1) = addr.find('.') {
-            if let Some(dot2) = addr[dot1+1..].find('.') {
-                let second_octet = &addr[dot1+1..dot1+1+dot2];
-                if let Ok(num) = second_octet.parse::<u8>() {
-                    return num >= 16 && num <= 31;
-                }
-            }
-        }
-        false
-    }) ||
-    addr.starts_with("192.168.") ||
-    addr == "::1" ||
-    addr == "0:0:0:0:0:0:0:1" ||
-    addr == "0.0.0.0"
-}
-
 fn cleanup_old_contexts(
     process_contexts: &mut HashMap<u32, ProcessContext>,
     alert_state: &mut AlertState,
 ) {
     let now = chrono::Utc::now();
-    
+
     // Remove old process contexts (older than 1 hour)
     let old_pids: Vec<u32> = process_contexts
         .iter()
         .filter(|(_, context)| now - context.start_time > chrono::Duration::hours(1))
         .map(|(&pid, _)| pid)
         .collect();
-    
+
     for pid in old_pids {
         process_contexts.remove(&pid);
     }
-    
+
     // Clean up old start times
     alert_state.process_start_times.retain(|_, time| {
         now - *time < chrono::Duration::hours(1)
     });
-    
+
     // Clean up old evaluated processes
     alert_state.evaluated_processes.retain(|&pid| {
         process_contexts.contains_key(&pid)
     });
-    
+
     // Clean up old events (keep last 1000)
     while alert_state.recent_events.len() > 1000 {
         alert_state.recent_events.pop_front();
@@ -1633,7 +1317,6 @@ fn cleanup_old_contexts(
 }
 
 fn load_initial_iocs(alert_state: &mut AlertState, config: &Config) {
-    // Load from config file
     if let Some(iocs) = &config.known_malicious_iocs {
         alert_state.known_malicious_ips.extend(iocs.ips.iter().cloned());
         alert_state.known_malicious_domains.extend(iocs.domains.iter().cloned());

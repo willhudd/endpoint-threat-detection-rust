@@ -24,6 +24,11 @@ pub struct ConnectionAttempt {
     pub dest_port: u16,
 }
 
+pub struct CmdlineAnalysis {
+    pub flags: Vec<String>,
+    pub cmd_score: u8,
+}
+
 lazy_static::lazy_static! {
     pub static ref GLOBAL_SENDER: Mutex<Option<Arc<Sender<BaseEvent>>>> = Mutex::new(None);
     pub static ref RECENT_CONNECTIONS: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
@@ -324,6 +329,75 @@ pub fn is_common_short_lived_process(process_name: &str) -> bool {
     COMMON_SHORT_LIVED.iter().any(|&name| lower.contains(name))
 }
 
+/// Legitimate, well-known processes that are not expected to be involved in malicious activity.
+/// NOTE: Being known-good suppresses beaconing/scoring heuristics but does NOT suppress IOC hits.
+pub fn is_known_good_process(process_name: &str, command_line: &str) -> bool {
+    const KNOWN_GOOD: &[&str] = &[
+        // Browsers
+        "chrome.exe", "firefox.exe", "msedge.exe", "opera.exe", "brave.exe",
+        // Development tools
+        "code.exe", "devenv.exe", "intellij.exe", "pycharm.exe", "webstorm.exe",
+        // Communication
+        "teams.exe", "slack.exe", "discord.exe", "zoom.exe", "skype.exe",
+        // Cloud storage
+        "onedrive.exe", "dropbox.exe", "googledrivesync.exe",
+        // Music/Media
+        "spotify.exe", "vlc.exe", "itunes.exe",
+        // Gaming
+        "steam.exe", "epicgameslauncher.exe", "battle.net.exe",
+        // NVIDIA
+        "nvidia overlay.exe", "nvsphelper64.exe",
+        // Windows components
+        "searchhost.exe", "backgroundtaskhost.exe", "runtimebroker.exe",
+        // Creative / Office
+        "adobe creative cloud.exe", "creative cloud.exe", "ccxprocess.exe",
+        "winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe",
+    ];
+    const LEGIT_PS_PATTERNS: &[&str] = &[
+        "get-process", "get-service", "get-eventlog", "import-module",
+        "update-help", "get-help", "get-command", "start-service",
+        "stop-service", "restart-service", "get-wmiobject", "get-ciminstance",
+    ];
+
+    let lower_name = process_name.to_lowercase();
+    let lower_cmd = command_line.to_lowercase();
+
+    if KNOWN_GOOD.iter().any(|&p| lower_name.contains(p)) {
+        return true;
+    }
+
+    // PowerShell running common admin commands is considered known-good
+    if lower_name.contains("powershell.exe") {
+        if LEGIT_PS_PATTERNS.iter().any(|&p| lower_cmd.contains(p)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true for suspicious parent→child process relationships that indicate
+/// living-off-the-land or script-based lateral movement.
+pub fn is_suspicious_parent_process(child_name: &str, parent_name: &str) -> bool {
+    let child_lower = child_name.to_lowercase();
+    let parent_lower = parent_name.to_lowercase();
+
+    // PowerShell spawning PowerShell is the canonical spawn-and-exit evasion pattern.
+    (parent_lower.contains("powershell") && child_lower.contains("powershell")) ||
+    (parent_lower.contains("pwsh") && child_lower.contains("powershell")) ||
+    (parent_lower.contains("powershell") && child_lower.contains("pwsh")) ||
+    // Scripts/documents spawning shells
+    (parent_lower.contains("explorer.exe") && child_lower.contains("powershell.exe")) ||
+    (parent_lower.contains("svchost.exe") && child_lower.contains("cmd.exe")) ||
+    (parent_lower.contains("services.exe") && child_lower.contains("wscript.exe")) ||
+    (parent_lower.contains("winword.exe") && child_lower.contains("powershell.exe")) ||
+    (parent_lower.contains("excel.exe") && child_lower.contains("cmd.exe")) ||
+    (parent_lower.contains("outlook.exe") && child_lower.contains("powershell.exe")) ||
+    // cmd/wscript spawning powershell
+    (parent_lower.contains("cmd.exe") && child_lower.contains("powershell.exe")) ||
+    (parent_lower.contains("wscript.exe") && child_lower.contains("powershell.exe")) ||
+    (parent_lower.contains("cscript.exe") && child_lower.contains("powershell.exe"))
+}
+
 pub fn is_chrome_subprocess(pid: u32, process_name: &str) -> bool {
     if process_name.to_lowercase().contains("chrome") {
         return true;
@@ -369,54 +443,209 @@ pub fn is_browser_related_process(pid: u32, process_name: &str) -> bool {
         || lower.contains("--type=")  // Chrome subprocess flag
 }
 
-pub fn analyze_command_line(process_name: &str, command_line: &str) -> Vec<String> {
-    let mut suspicious_flags = Vec::new();
-    let lower_name = process_name.to_lowercase();
+pub fn analyze_command_line(command_line: &str) -> CmdlineAnalysis {
+    let mut flags = Vec::new();
     let lower_cmd = command_line.to_lowercase();
+    let mut cmd_score = 0u8;
+    
+    let has_bypass  = lower_cmd.contains("-executionpolicy bypass") || lower_cmd.contains("-ep bypass");
+    let has_hidden  = lower_cmd.contains("-windowstyle hidden")     || lower_cmd.contains("-w hidden");
+    let has_noprof  = lower_cmd.contains("-noprofile")              || lower_cmd.contains("-nop");
+    let has_nointer = lower_cmd.contains("-noninteractive")         || lower_cmd.contains("-noni");
+    let has_encoded = lower_cmd.contains("-encodedcommand")         || lower_cmd.contains("-enc ");
+    let has_file    = lower_cmd.contains(" -file ")                 || lower_cmd.contains(" -f ");
 
-    if lower_name.contains("powershell") {
-        if lower_cmd.contains("-windowstyle hidden") || lower_cmd.contains("-w hidden") {
-            suspicious_flags.push("-WindowStyle Hidden".to_string());
-        }
-        if lower_cmd.contains("-executionpolicy bypass") || lower_cmd.contains("-ep bypass") {
-            suspicious_flags.push("-ExecutionPolicy Bypass".to_string());
-        }
-        if lower_cmd.contains("-noprofile") || lower_cmd.contains("-nop") {
-            suspicious_flags.push("-NoProfile".to_string());
-        }
-        if lower_cmd.contains("-encodedcommand") || lower_cmd.contains("-e ") {
-            suspicious_flags.push("-EncodedCommand".to_string());
-        }
-        if lower_cmd.contains("-noninteractive") {
-            suspicious_flags.push("-NonInteractive".to_string());
-        }
-        if lower_cmd.contains("iex ") || lower_cmd.contains("invoke-expression") {
-            suspicious_flags.push("Invoke-Expression".to_string());
-        }
-        if lower_cmd.contains("downloadstring") || lower_cmd.contains("downloadfile") {
-            suspicious_flags.push("Web Client Download".to_string());
-        }
-        if lower_cmd.contains("getasynckeystate") || lower_cmd.contains("keylog") {
-            suspicious_flags.push("Keylogging API".to_string());
-        }
+    if has_bypass  { flags.push("-ExecutionPolicy Bypass".to_string());  cmd_score = cmd_score.saturating_add(1); log::info!("🟡 [PSScore +1] -ExecutionPolicy Bypass"); }
+    if has_hidden  { flags.push("-WindowStyle Hidden".to_string());      cmd_score = cmd_score.saturating_add(1); log::info!("🟡 [PSScore +1] -WindowStyle Hidden"); }
+    if has_noprof  { flags.push("-NoProfile".to_string());               cmd_score = cmd_score.saturating_add(1); log::info!("🟡 [PSScore +1] -NoProfile"); }
+    if has_nointer { flags.push("-NonInteractive".to_string()); }
+
+    if has_nointer && has_hidden {
+        cmd_score = cmd_score.saturating_add(1);
+        log::info!("🟡 [PSScore +1] -NonInteractive + -WindowStyle Hidden combo");
+    }
+    if has_encoded {
+        flags.push("-EncodedCommand".to_string());
+        cmd_score = cmd_score.saturating_add(2);
+        log::warn!("🟠 [PSScore +2] -EncodedCommand (base64 payload)");
+    }
+    if has_bypass && has_hidden && has_noprof {
+        cmd_score = cmd_score.saturating_add(2);
+        log::warn!("🟠 [PSScore +2] Evasion trifecta: Bypass + Hidden + NoProfile");
+    }
+    if has_bypass && has_hidden && has_file {
+        cmd_score = cmd_score.saturating_add(1);
+        log::warn!("🟡 [PSScore +1] Covert file delivery: Bypass + Hidden + -File");
     }
 
-    if lower_cmd.contains("webhook") || lower_cmd.contains("discord.com/api/webhooks") {
-        suspicious_flags.push("Webhook URL".to_string());
+    if lower_cmd.contains("iex ") || lower_cmd.contains("invoke-expression") {
+        flags.push("Invoke-Expression".to_string());
+        cmd_score = cmd_score.saturating_add(1);
+        log::warn!("🟡 [PSScore +1] Invoke-Expression / IEX");
     }
-    if lower_cmd.contains("http://") || lower_cmd.contains("https://") {
-        if lower_name.contains("powershell") || lower_name.contains("cmd") ||
-           lower_name.contains("wscript") || lower_name.contains("cscript") {
-            suspicious_flags.push("Network Download in Script".to_string());
-        }
+    if lower_cmd.contains("-join") || lower_cmd.contains("`") {
+        cmd_score = cmd_score.saturating_add(1);
+        log::info!("🟡 [PSScore +1] String obfuscation (-join / backtick)");
     }
+    if lower_cmd.contains("[char]") {
+        cmd_score = cmd_score.saturating_add(1);
+        log::info!("🟡 [PSScore +1] [char] assembly obfuscation");
+    }
+    if lower_cmd.contains("getasynckeystate") || lower_cmd.contains("keylog") {
+        flags.push("Keylogging API".to_string());
+        cmd_score = cmd_score.saturating_add(3);
+        log::warn!("🔴 [PSScore +3] GetAsyncKeyState Win32 API");
+    }
+    if lower_cmd.contains("getkeystate") {
+        cmd_score = cmd_score.saturating_add(3);
+        log::warn!("🔴 [PSScore +3] GetKeyState Win32 API");
+    }
+    if lower_cmd.contains("setwindowshookex") || lower_cmd.contains("setkeyboardhook") {
+        cmd_score = cmd_score.saturating_add(3);
+        log::warn!("🔴 [PSScore +3] SetWindowsHookEx / SetKeyboardHook");
+    }
+    if lower_cmd.contains("dllimport") && lower_cmd.contains("user32.dll") {
+        cmd_score = cmd_score.saturating_add(3);
+        log::warn!("🔴 [PSScore +3] user32.dll P/Invoke DllImport");
+    }
+    if lower_cmd.contains("system.runtime.interopservices") {
+        cmd_score = cmd_score.saturating_add(2);
+        log::warn!("🟠 [PSScore +2] System.Runtime.InteropServices (P/Invoke)");
+    }
+    if lower_cmd.contains("add-type") && lower_cmd.contains("system.windows.forms") {
+        cmd_score = cmd_score.saturating_add(2);
+        log::warn!("🟠 [PSScore +2] Add-Type System.Windows.Forms (key capture)");
+    }
+    const SPECIAL_KEYS: &[&str] = &["[backspace]","[enter]","[tab]","[shift]","[ctrl]","[alt]"];
+    let sk_count = SPECIAL_KEYS.iter().filter(|&&k| lower_cmd.contains(k)).count();
+    if sk_count >= 2 {
+        cmd_score = cmd_score.saturating_add(2);
+        log::warn!("🟠 [PSScore +2] {} special-key logging tokens", sk_count);
+    }
+    if lower_cmd.contains("currentversion\\run") || lower_cmd.contains("currentversion/run") {
+        cmd_score = cmd_score.saturating_add(2);
+        log::warn!("🟠 [PSScore +2] Registry Run-key persistence");
+    }
+    if (lower_cmd.contains("while ($true)") || lower_cmd.contains("while (1)"))
+        && lower_cmd.contains("start-sleep")
+    {
+        cmd_score = cmd_score.saturating_add(2);
+        log::warn!("🟠 [PSScore +2] Infinite polling loop (while + Start-Sleep)");
+    }
+    if lower_cmd.contains("$env:appdata") && lower_cmd.contains(".txt") {
+        cmd_score = cmd_score.saturating_add(1);
+        log::info!("🟡 [PSScore +1] AppData .txt log-file reference");
+    }
+    if lower_cmd.contains("downloadstring") || lower_cmd.contains("downloadfile") {
+        flags.push("Web Client Download".to_string());
+        cmd_score = cmd_score.saturating_add(1);
+        log::warn!("🟡 [PSScore +1] Download-cradle (WebClient / DownloadString)");
+    }
+    if lower_cmd.contains("frombase64string") {
+        cmd_score = cmd_score.saturating_add(2);
+        log::warn!("🟠 [PSScore +2] [Convert]::FromBase64String");
+    }
+
     if lower_cmd.contains("frombase64string") ||
        lower_cmd.contains("[convert]::") ||
        (lower_cmd.contains("-f ") && lower_cmd.contains("{0}")) {
-        suspicious_flags.push("Obfuscation Patterns".to_string());
+        flags.push("Obfuscation Patterns".to_string());
     }
+    CmdlineAnalysis { flags, cmd_score }
+}
 
-    suspicious_flags
+/// Returns a label if the process and command line match a known LOLBAS abuse pattern,
+/// or `None` if no match.
+pub fn identify_lolbas_abuse(process_name: &str, command_line: &str) -> Option<&'static str> {
+    let lower_name = process_name.to_lowercase();
+    let lower_cmd = command_line.to_lowercase();
+
+    match lower_name.as_str() {
+        "rundll32.exe" => {
+            if lower_cmd.contains(".dll,") &&
+               (lower_cmd.contains("http://") || lower_cmd.contains("https://") ||
+                lower_cmd.contains("regsvr") || lower_cmd.contains("javascript:"))
+            {
+                if lower_cmd.contains("javascript:") {
+                    return Some("Rundll32 JavaScript Execution");
+                }
+                return Some("Rundll32 Remote DLL Load");
+            }
+        }
+        "regsvr32.exe" => {
+            if lower_cmd.contains("/s") &&
+               (lower_cmd.contains("http://") || lower_cmd.contains("https://") ||
+                lower_cmd.contains(".sct") || lower_cmd.contains(".scrobj"))
+            {
+                if lower_cmd.contains(".sct") {
+                    return Some("Regsvr32 SCT Scriptlet Execution");
+                }
+                return Some("Regsvr32 Remote Script Execution");
+            }
+        }
+        "mshta.exe" => {
+            if lower_cmd.contains("http://") || lower_cmd.contains("https://") ||
+               lower_cmd.contains("javascript:") || lower_cmd.contains("vbscript:")
+            {
+                return Some("Mshta Remote Script Execution");
+            }
+        }
+        "certutil.exe" => {
+            if lower_cmd.contains("-urlcache") || lower_cmd.contains("-split") ||
+               lower_cmd.contains("-decode") || lower_cmd.contains("-encode")
+            {
+                if lower_cmd.contains("-urlcache") {
+                    return Some("Certutil File Download");
+                }
+                return Some("Certutil Encode/Decode Abuse");
+            }
+        }
+        "bitsadmin.exe" => {
+            if lower_cmd.contains("/transfer") || lower_cmd.contains("/create") ||
+               lower_cmd.contains("/addfile") || lower_cmd.contains("/setnotifycmdline")
+            {
+                return Some("Bitsadmin File Transfer");
+            }
+        }
+        "wmic.exe" => {
+            if lower_cmd.contains("process call create") ||
+               (lower_cmd.contains("/node:") && lower_cmd.contains("process create"))
+            {
+                return Some("WMIC Remote Process Creation");
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Returns true if the address is a loopback, RFC-1918 private, link-local, or
+/// unspecified address that should not be treated as an external connection.
+pub fn is_private_or_local(addr: &str) -> bool {
+    if addr.starts_with("127.") || addr.starts_with("192.168.") {
+        return true;
+    }
+    if addr.starts_with("10.") {
+        return true;
+    }
+    if addr.starts_with("172.") {
+        // RFC-1918: 172.16.0.0 – 172.31.255.255
+        let second_octet: Option<u8> = addr.split('.').nth(1).and_then(|o| o.parse().ok());
+        if let Some(n) = second_octet {
+            if (16..=31).contains(&n) {
+                return true;
+            }
+        }
+    }
+    // IPv6 loopback
+    if addr == "::1" || addr == "0:0:0:0:0:0:0:1" {
+        return true;
+    }
+    // Unspecified / any-address
+    if addr == "0.0.0.0" {
+        return true;
+    }
+    false
 }
 
 pub fn is_suspicious_domain(domain: &str) -> bool {
@@ -434,34 +663,42 @@ pub fn is_suspicious_domain(domain: &str) -> bool {
     SUSPICIOUS_TLDS.iter().any(|tld| lower.ends_with(tld))
 }
 
+const PORT_METADATA: &[(u16, bool, &str)] = &[
+    (4444,  true,  "Metasploit default"),
+    (31337, true,  "Back Orifice"),
+    (6667,  true,  "IRC"),
+    (6660,  true,  "IRC"),
+    (9999,  true,  "Common malware"),
+    (5555,  true,  "Common malware"),
+    (8877,  true,  "Common malware"),
+    (1337,  true,  "Elite/Leet port"),
+    (1234,  true,  "Common malware / test port"),
+    (4321,  true,  "Common malware / test port"),
+    (6789,  true,  "Common malware"),
+    (9898,  true,  "Common malware"),
+    (9988,  true,  "Common malware"),
+    (2333,  true,  "Common malware"),
+    (2334,  true,  "Common malware"),
+    (3389,  false, "RDP"),
+    (22,    false, "SSH"),
+    (23,    false, "Telnet"),
+    (21,    false, "FTP"),
+    (25,    false, "SMTP"),
+    (110,   false, "POP3"),
+    (143,   false, "IMAP"),
+    (445,   false, "SMB"),
+    (135,   false, "RPC"),
+];
+
 pub fn is_high_risk_port(port: u16) -> bool {
-    matches!(port,
-        4444 | 31337 | 6667 | 6660 | 9999 | 5555 | 8877 | 1337 |
-        1234 | 4321 | 6789 | 9898 | 9988 | 2333 | 2334
-    )
+    PORT_METADATA.iter().any(|&(p, high_risk, _)| p == port && high_risk)
 }
 
 pub fn describe_port(port: u16) -> &'static str {
-    match port {
-        4444  => "Metasploit default",
-        31337 => "Back Orifice",
-        6667  => "IRC",
-        6660  => "IRC",
-        9999  => "Common malware",
-        5555  => "Common malware",
-        8877  => "Common malware",
-        1337  => "Elite/Leet port",
-        3389  => "RDP",
-        22    => "SSH",
-        23    => "Telnet",
-        21    => "FTP",
-        25    => "SMTP",
-        110   => "POP3",
-        143   => "IMAP",
-        445   => "SMB",
-        135   => "RPC",
-        _     => "Unknown",
-    }
+    PORT_METADATA.iter()
+        .find(|&&(p, _, _)| p == port)
+        .map(|&(_, _, desc)| desc)
+        .unwrap_or("Unknown")
 }
 
 pub fn truncate_string(s: &str, max_len: usize) -> String {
