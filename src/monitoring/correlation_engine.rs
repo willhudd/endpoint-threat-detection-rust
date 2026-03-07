@@ -1234,7 +1234,7 @@ fn fire_alert(context: &mut ProcessContext, alert_tx: &Sender<Alert>) {
     let parent_display = if context.parent_pid == 0 {
         "Unknown (exited before ETW name resolution)".to_string()
     } else if context.parent_name.is_empty() || context.parent_name == "Unknown" {
-        format!("Unknown (PID: {} — exited before name resolved)", context.parent_pid)
+        format!("Unknown")
     } else {
         context.parent_name.clone()
     };
