@@ -218,10 +218,11 @@ fn handle_process_start(
 
     let context = process_contexts.get_mut(&pid).unwrap();
 
-    // For each suspicious command-line flag found, add 1 to the suspicion score
-    for flag in &cmd_analysis.flags {
+    // For each suspicious command-line flag found, add 1 to the suspicion score.
+    for _flag in &cmd_analysis.flags {
         context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG;
-        context.alert_reasons.push(format!("Suspicious flag: {}", flag));
+        let flags_joined = cmd_analysis.flags.join(", ");
+        context.alert_reasons.push(format!("Suspicious command flags: {}", flags_joined));
     }
 
     // Check for LOLBAS abuse patterns
@@ -230,14 +231,15 @@ fn handle_process_start(
         context.alert_reasons.push(format!("LOLBAS pattern: {}", pattern));
     }
 
-    // Scans the contents of a script file referenced in the command line
+    // Scans the contents of a script file referenced in the command line.
     if context.is_scripting_engine && !command_line.is_empty() {
-        let script_hits = scan_script_file_for_apis(&command_line);
-        for (reason, weight) in script_hits {
-            if weight > 0 {
-                context.suspicion_score += weight;
-            }
-            context.alert_reasons.push(reason);
+        let (matched_names, total_weight) = scan_script_file_for_apis(&command_line);
+        if !matched_names.is_empty() {
+            context.suspicion_score += total_weight;
+            context.alert_reasons.push(format!(
+                "Script scan found [\n    {}\n]",
+                matched_names.join(",\n    ")
+            ));
         }
     }
 }
@@ -556,9 +558,10 @@ fn handle_network_connection(
     alert_state.evaluated_processes.insert(pid);
 }
 
-// Scans the contents of a script file referenced in the command line
-fn scan_script_file_for_apis(command_line: &str) -> Vec<(String, u32)> {
-    let mut hits: Vec<(String, u32)> = Vec::new();
+// Scans the contents of a script file referenced in the command line.
+fn scan_script_file_for_apis(command_line: &str) -> (Vec<String>, u32) {
+    let mut matched: Vec<String> = Vec::new();
+    let mut total_score: u32 = 0;
 
     let lower_cmd = command_line.to_lowercase();
     let file_arg_pos = lower_cmd.find(" -file ").or_else(|| lower_cmd.find(" -f "));
@@ -578,80 +581,65 @@ fn scan_script_file_for_apis(command_line: &str) -> Vec<(String, u32)> {
 
     let path = match script_path {
         Some(p) if !p.is_empty() => p,
-        _ => return hits,
+        _ => return (matched, total_score),
     };
 
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(_) => return hits,
+        Err(_) => return (matched, total_score),
     };
 
     let lower = content.to_lowercase();
 
     const KEYLOG_APIS: &[(&str, &str)] = &[
-        ("getasynckeystate",    "GetAsyncKeyState (keylogging API) found in script"),
-        ("getkeystate",         "GetKeyState (keylogging API) found in script"),
-        ("setwindowshookex",    "SetWindowsHookEx (keyboard hook) found in script"),
-        ("setkeyboardhook",     "SetKeyboardHook found in script"),
+        ("getasynckeystate", "GetAsyncKeyState"),
+        ("getkeystate",      "GetKeyState"),
+        ("setwindowshookex", "SetWindowsHookEx"),
+        ("setkeyboardhook",  "SetKeyboardHook"),
     ];
 
     let mut keylog_hit = false;
-    for (api, reason) in KEYLOG_APIS {
+    for (api, display_name) in KEYLOG_APIS {
         if lower.contains(api) {
             if !keylog_hit {
-                // Only score once for keylogging APIs but collect all matching reasons
-                hits.push((reason.to_string(), WEIGHT_KEYLOGGER_API_RUNTIME));
+                total_score += WEIGHT_KEYLOGGER_API_RUNTIME;
                 keylog_hit = true;
-            } else {
-                // Additional APIs found — add reason with no extra weight
-                hits.push((reason.to_string(), 0));
             }
+            matched.push(display_name.to_string());
         }
     }
 
-    const CRED_APIS: &[(&str, &str)] = &[
-        ("dllimport",                       "DllImport (P/Invoke) found in script"),
-        ("user32.dll",                      "User32.dll interop found in script"),
-        ("system.runtime.interopservices",  "System.Runtime.InteropServices found in script"),
-        ("add-type",                        "Add-Type (dynamic code compilation) found in script"),
-    ];
-
-    // Only score the combination of Add-Type + DllImport + user32 as a unit avoids false positives
-    let has_addtype  = lower.contains("add-type");
+    let has_addtype   = lower.contains("add-type");
     let has_dllimport = lower.contains("dllimport");
-    let has_user32   = lower.contains("user32.dll");
+    let has_user32    = lower.contains("user32.dll");
+    let has_interop   = lower.contains("system.runtime.interopservices");
 
     if has_addtype && has_dllimport && has_user32 {
-        hits.push((
-            "Script uses Add-Type + DllImport + User32.dll (P/Invoke keylogger pattern)".to_string(),
-            WEIGHT_KEYLOGGER_API,
-        ));
-    } else {
-        // Score individual hits only if they appear without the full combination
-        for (api, reason) in CRED_APIS {
-            if lower.contains(api) {
-                hits.push((reason.to_string(), 0)); // informational only, no score
-            }
-        }
+        total_score += WEIGHT_KEYLOGGER_API;
     }
 
-    if lower.contains("currentversion\\run") || lower.contains("currentversion/run") {
-        hits.push((
-            "Registry Run key persistence found in script".to_string(),
-            WEIGHT_SUSPICIOUS_FLAG,
-        ));
+    if has_addtype   { matched.push("Add-Type".to_string()); }
+    if has_dllimport { matched.push("DllImport".to_string()); }
+    if has_user32    { matched.push("User32.dll".to_string()); }
+    if has_interop   { matched.push("System.Runtime.InteropServices".to_string()); }
+
+    let has_run_backslash = lower.contains("currentversion\\run");
+    let has_run_slash     = lower.contains("currentversion/run");
+    if has_run_backslash || has_run_slash {
+        total_score += WEIGHT_SUSPICIOUS_FLAG;
+    }
+    if has_run_backslash { matched.push("currentversion\\run".to_string()); }
+    if has_run_slash     { matched.push("currentversion/run".to_string()); }
+
+    let has_loop  = lower.contains("while ($true)") || lower.contains("while (1)");
+    let has_sleep = lower.contains("start-sleep");
+    if has_loop  { matched.push("while ($true)".to_string()); }
+    if has_sleep { matched.push("start-sleep".to_string()); }
+    if has_loop && has_sleep {
+        total_score += WEIGHT_SUSPICIOUS_FLAG;
     }
 
-    if (lower.contains("while ($true)") || lower.contains("while (1)"))
-        && lower.contains("start-sleep")
-    {
-        hits.push((
-            "Persistent loop with sleep (beaconing/keylogger loop) found in script".to_string(),
-            WEIGHT_SUSPICIOUS_FLAG,
-        ));
-    }
-
-    hits
+    (matched, total_score)
 }
 
 fn identify_webhook_service_by_domain(domain: &str) -> Option<&'static str> {
@@ -973,10 +961,9 @@ fn evaluate_network_alert(
         let new_flags = analyze_command_line(&context.command_line).flags;
         if !new_flags.is_empty() {
             context.suspicious_flags = new_flags.clone();
-            for flag in &new_flags {
-                context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG;
-                context.alert_reasons.push(format!("Suspicious flag (late-detected): {}", flag));
-            }
+            context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG * new_flags.len() as u32;
+            let flags_joined = new_flags.join(", ");
+            context.alert_reasons.push(format!("Suspicious command flags (late-detected): {}", flags_joined));
         }
     }
 
@@ -1049,19 +1036,27 @@ fn check_temporal_correlations(
                     .map(|ctx| format!("{} (PID: {})", ctx.process_name, ctx.pid))
                     .collect();
 
+                let detail_items = vec![
+                    format!("Process Count = {}", processes.len()),
+                    format!("Scripting Count = {}", scripting_count),
+                    format!("Processes = {}", processes.join("; ")),
+                    format!("Timeframe = 30 seconds"),
+                ];
+                let indicator_reasons: Vec<String> = detail_items.clone();
                 generate_alert(
                     crate::events::alert::AlertSeverity::Medium,
                     "MultipleScriptingProcesses",
                     "Multiple scripting processes started within short timeframe",
                     "System",
                     0,
+                    0,
+                    "N/A",
+                    "N/A",
+                    "",
+                    &indicator_reasons,
+                    false,
                     alert_tx,
-                    vec![
-                        format!("Process Count = {}", processes.len()),
-                        format!("Scripting Count = {}", scripting_count),
-                        format!("Processes = {}", processes.join("; ")),
-                        format!("Timeframe = 30 seconds"),
-                    ],
+                    detail_items,
                 );
             }
         }
@@ -1184,28 +1179,7 @@ fn fire_alert(context: &mut ProcessContext, alert_tx: &Sender<Alert>) {
         )
     };
 
-    let mut all_details = vec![
-        format!("Total Suspicion Score = {}/{}", context.suspicion_score, SUSPICION_THRESHOLD),
-        format!("Indicators Detected ({}):", reasons.len()),
-    ];
-    for (i, reason) in reasons.iter().take(10).enumerate() {
-        all_details.push(format!("  {}. {}", i + 1, reason));
-    }
-    if reasons.len() > 10 {
-        all_details.push(format!("  ... and {} more", reasons.len() - 10));
-    }
-
-    all_details.push(format!("Process = {} (PID: {})", context.process_name, context.pid));
-
-    let parent_display = if context.parent_pid == 0 {
-        "Unknown (exited before ETW name resolution)".to_string()
-    } else if context.parent_name.is_empty() || context.parent_name == "Unknown" {
-        format!("Unknown (PID: {} — exited before name resolved)", context.parent_pid)
-    } else {
-        format!("{} (PID: {})", context.parent_name, context.parent_pid)
-    };
-    all_details.push(format!("Parent = {}", parent_display));
-
+    // Network summary
     let total_conns = context.network_connections.len();
     let external_conns: Vec<_> = context.network_connections.iter()
         .filter(|c| c.is_external)
@@ -1216,47 +1190,54 @@ fn fire_alert(context: &mut ProcessContext, alert_tx: &Sender<Alert>) {
     let quic_conns = context.network_connections.iter()
         .filter(|c| c.protocol == "QUIC")
         .count();
-    let unique_dests: std::collections::HashSet<_> = context.network_connections.iter()
-        .filter(|c| c.is_external)
-        .map(|c| &c.remote_addr)
-        .collect();
 
-    let mut net_summary = format!(
-        "Network Events = {} total ({} external, {} unique destinations",
-        total_conns, external_conns.len(), unique_dests.len()
-    );
-    if quic_conns > 0 {
-        net_summary.push_str(&format!(
-            ", {} QUIC/HTTP3 — note: QUIC sessions carry multiple requests per ETW event",
-            quic_conns
-        ));
-    }
-    if total_bytes > 0 {
-        net_summary.push_str(&format!(", ~{} bytes transferred", total_bytes));
-    }
-    net_summary.push(')');
-    all_details.push(net_summary);
-
-    for conn in &external_conns {
+    // Build the network events line:
+    // "N total (M external)" or "N total (M external to IP:PORT via PROTO)"
+    let network_events_line = if external_conns.is_empty() {
+        format!("{} total ({} external)", total_conns, external_conns.len())
+    } else {
+        let conn = &external_conns[0];
         let proto_label = if conn.protocol == "QUIC" { "QUIC/HTTP3" } else { &conn.protocol };
-        let size_label = conn.data_size
-            .map(|b| format!(" [{} bytes]", b))
-            .unwrap_or_default();
-        let domain_label = conn.remote_domain.as_deref()
-            .map(|d| format!(" ({})", d))
-            .unwrap_or_default();
-        all_details.push(format!(
-            "  → {}:{}{}{} via {}",
-            conn.remote_addr, conn.remote_port, domain_label, size_label, proto_label
-        ));
-    }
+        let mut line = format!(
+            "{} total ({} external to {}:{} via {})",
+            total_conns, external_conns.len(),
+            conn.remote_addr, conn.remote_port, proto_label
+        );
+        if quic_conns > 0 {
+            line.push_str(" [QUIC: multiple reqs/event]");
+        }
+        if total_bytes > 0 {
+            line.push_str(&format!(", ~{} bytes", total_bytes));
+        }
+        line
+    };
 
+    // Build details vec for the Alert struct (kept for structured consumers)
+    let mut all_details = vec![
+        format!("Total Suspicion Score = {}/{}", context.suspicion_score, SUSPICION_THRESHOLD),
+        format!("Network Events = {}", network_events_line),
+    ];
     if !context.command_line.is_empty() {
         all_details.push(format!(
             "Command Line = {}",
             truncate_string(&context.command_line, 200)
         ));
     }
+    all_details.push(format!("Indicators Detected ({}):", reasons.len()));
+    for (i, reason) in reasons.iter().take(10).enumerate() {
+        all_details.push(format!("  {}. {}", i + 1, reason));
+    }
+    if reasons.len() > 10 {
+        all_details.push(format!("  ... and {} more", reasons.len() - 10));
+    }
+
+    let parent_display = if context.parent_pid == 0 {
+        "Unknown (exited before ETW name resolution)".to_string()
+    } else if context.parent_name.is_empty() || context.parent_name == "Unknown" {
+        format!("Unknown (PID: {} — exited before name resolved)", context.parent_pid)
+    } else {
+        context.parent_name.clone()
+    };
 
     generate_alert(
         severity,
@@ -1264,6 +1245,12 @@ fn fire_alert(context: &mut ProcessContext, alert_tx: &Sender<Alert>) {
         &description,
         &context.process_name,
         context.pid,
+        context.parent_pid,
+        &parent_display,
+        &network_events_line,
+        context.command_line.as_str(),
+        &reasons,
+        is_escalation,
         alert_tx,
         all_details,
     );
@@ -1275,6 +1262,12 @@ fn generate_alert(
     description: &str,
     process_name: &str,
     pid: u32,
+    parent_pid: u32,
+    parent_name: &str,
+    network_events_line: &str,
+    command_line: &str,
+    indicators: &[String],
+    is_escalation: bool,
     alert_tx: &Sender<Alert>,
     details: Vec<String>,
 ) {
@@ -1289,23 +1282,75 @@ fn generate_alert(
 
     let _ = alert_tx.send(alert);
 
+    const BORDER: &str = "╔═════════════════════════════════════════════════════════════";
+    const DIVIDER: &str = "╠═════════════════════════════════════════════════════════════";
+    const FOOTER: &str  = "╚═════════════════════════════════════════════════════════════";
+
+    let header = if is_escalation {
+        "║ 🚨 ALERT ESCALATION ⬆️"
+    } else {
+        "║ 🚨 ALERT"
+    };
+
+    let severity_label = format!("{:?}", severity);
+
+    // Format indicators block
+    let mut indicator_lines = format!("║   Indicators Detected ({}):\n", indicators.len());
+    for (i, reason) in indicators.iter().take(10).enumerate() {
+        // Multi-line indicators (e.g. script scan lists) get indented continuation lines
+        let mut lines_iter = reason.lines();
+        if let Some(first) = lines_iter.next() {
+            indicator_lines.push_str(&format!("║     {}. {}\n", i + 1, first));
+            for cont in lines_iter {
+                indicator_lines.push_str(&format!("║        {}\n", cont));
+            }
+        }
+    }
+    if indicators.len() > 10 {
+        indicator_lines.push_str(&format!("║     ... and {} more\n", indicators.len() - 10));
+    }
+    // Trim trailing newline so the footer sits flush
+    let indicator_lines = indicator_lines.trim_end_matches('\n');
+
+    let cmd_line = if command_line.is_empty() {
+        String::new()
+    } else {
+        format!("\n║   Command Line = {}", truncate_string(command_line, 200))
+    };
+
     log::warn!(
         "\n\
-        ╔══════════════════════════════════════════════\n\
-        ║ 🚨 ALERT: {}\n\
-        ╠══════════════════════════════════════════════\n\
-        ║ Severity = {:?}\n\
-        ║ Process  = {} (PID: {})\n\
-        ║ Rule     = {}\n\
+        {BORDER}\n\
+        {header}\n\
+        {DIVIDER}\n\
+        ║ Severity = {severity_label}\n\
+        ║ Process  = {process_name}\n\
+        ║ PID      = {pid}\n\
+        ║ Parent   = {parent_name}\n\
+        ║ PPID     = {parent_pid}\n\
+        ║ Rule     = {rule_name}\n\
         ║ Details:\n\
-        {}\n\
-        ╚══════════════════════════════════════════════",
-        description,
-        severity,
-        process_name,
-        pid,
-        rule_name,
-        details.iter().map(|d| format!("║   {}", d)).collect::<Vec<_>>().join("\n")
+        ║   Total Suspicion Score = {description_score}\n\
+        ║   Network Events = {network_events_line}{cmd_line}\n\
+        {indicator_lines}\n\
+        {FOOTER}",
+        BORDER = BORDER,
+        header = header,
+        DIVIDER = DIVIDER,
+        severity_label = severity_label,
+        process_name = process_name,
+        pid = pid,
+        parent_name = parent_name,
+        parent_pid = parent_pid,
+        rule_name = rule_name,
+        description_score = {
+            // Extract "Score: X/Y" from description or fall back to details[0]
+            details.first().cloned().unwrap_or_default()
+        },
+        network_events_line = network_events_line,
+        cmd_line = cmd_line,
+        indicator_lines = indicator_lines,
+        FOOTER = FOOTER,
     );
 }
 
