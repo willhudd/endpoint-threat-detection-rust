@@ -185,15 +185,6 @@ pub fn run_network_monitor(
                 return;
             }
 
-            let direction = match event_id {
-                EVENT_ID_TCPIP_SEND       => "TCP Send",
-                EVENT_ID_TCPIP_RECV       => "TCP Recv",
-                EVENT_ID_TCPIP_CONNECT    => "TCP Connect",
-                EVENT_ID_TCPIP_DISCONNECT => "TCP Disconnect",
-                EVENT_ID_TCPIP_RECONNECT  => "TCP Reconnect",
-                _                         => "Unknown",
-            };
-
             if network_type == "Loopback" && !is_browser && !is_suspicious_loopback(&process_name, sport, dport) {
                 return;
             }
