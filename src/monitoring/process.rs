@@ -104,9 +104,32 @@ pub fn run_process_monitor(
 
             let base = match opcode {
                 1 => {
+                    let raw_parent_pid = parse_parent_pid(
+                        rec.UserData as *const u8,
+                        rec.UserDataLength,
+                    );
+
+                    // Guard against PID reuse: if the kernel has already recycled the
+                    // launcher's PID and reassigned it to this very process, the parent
+                    // field would falsely point to itself. Treat self-referential PIDs
+                    // as unknown (0) so spawn-and-exit Signal B (time-window) handles
+                    // the detection instead of Signal A (parent_pid linkage).
+                    let parent_pid = if raw_parent_pid == pid || raw_parent_pid <= 4 {
+                        0
+                    } else {
+                        raw_parent_pid
+                    };
+
+                    // Eagerly resolve and cache the parent name now — the short-lived
+                    // launcher may exit before the correlation engine processes this
+                    // event, making later lookups return "Unknown".
+                    if parent_pid != 0 {
+                        let _ = get_process_name_cached(parent_pid);
+                    }
+
                     cache_process_start(
                         pid,
-                        0,
+                        parent_pid,
                         &process_name,
                         None,
                     );
@@ -119,7 +142,7 @@ pub fn run_process_monitor(
 
                     let event = ProcessEvent::new_start(
                         pid,
-                        0,
+                        parent_pid,
                         process_name.clone(),
                     );
 
@@ -198,19 +221,11 @@ pub fn run_process_monitor(
     }
 }
 
-fn log_process_event(
-    process_name: &str,
-    pid: u32,
-    event_type: &str,
-) {
-    log::info!(
-        "\n\
-        ┌─ {} ───────────────────────────────────────────\n\
-        │ Process = {}\n\
-        │ PID     = {}\n\
-        └────────────────────────────────────────────────",
-        event_type,
-        process_name,
-        pid
-    );
+unsafe fn parse_parent_pid(user_data: *const u8, user_data_len: u16) -> u32 {
+    const PARENT_PID_OFFSET: usize = 8 + 4;
+    if user_data.is_null() || (user_data_len as usize) < PARENT_PID_OFFSET + 4 {
+        return 0;
+    }
+    let ptr = user_data.add(PARENT_PID_OFFSET) as *const u32;
+    ptr.read_unaligned()
 }
