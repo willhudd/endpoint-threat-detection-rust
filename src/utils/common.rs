@@ -320,15 +320,6 @@ pub fn is_scripting_engine(process_name: &str, command_line: &str) -> bool {
     false
 }
 
-pub fn is_common_short_lived_process(process_name: &str) -> bool {
-    const COMMON_SHORT_LIVED: &[&str] = &[
-        "conhost.exe", "dllhost.exe", "runtimebroker.exe",
-        "taskhostw.exe", "backgroundtaskhost.exe",
-    ];
-    let lower = process_name.to_lowercase();
-    COMMON_SHORT_LIVED.iter().any(|&name| lower.contains(name))
-}
-
 /// Legitimate, well-known processes that are not expected to be involved in malicious activity.
 /// NOTE: Being known-good suppresses beaconing/scoring heuristics but does NOT suppress IOC hits.
 pub fn is_known_good_process(process_name: &str, command_line: &str) -> bool {
@@ -455,97 +446,76 @@ pub fn analyze_command_line(command_line: &str) -> CmdlineAnalysis {
     let has_encoded = lower_cmd.contains("-encodedcommand")         || lower_cmd.contains("-enc ");
     let has_file    = lower_cmd.contains(" -file ")                 || lower_cmd.contains(" -f ");
 
-    if has_bypass  { flags.push("-ExecutionPolicy Bypass".to_string());  cmd_score = cmd_score.saturating_add(1); log::info!("🟡 [PSScore +1] -ExecutionPolicy Bypass"); }
-    if has_hidden  { flags.push("-WindowStyle Hidden".to_string());      cmd_score = cmd_score.saturating_add(1); log::info!("🟡 [PSScore +1] -WindowStyle Hidden"); }
-    if has_noprof  { flags.push("-NoProfile".to_string());               cmd_score = cmd_score.saturating_add(1); log::info!("🟡 [PSScore +1] -NoProfile"); }
+    if has_bypass  { flags.push("-ExecutionPolicy Bypass".to_string());  cmd_score = cmd_score.saturating_add(1); }
+    if has_hidden  { flags.push("-WindowStyle Hidden".to_string());      cmd_score = cmd_score.saturating_add(1); }
+    if has_noprof  { flags.push("-NoProfile".to_string());               cmd_score = cmd_score.saturating_add(1); }
     if has_nointer { flags.push("-NonInteractive".to_string()); }
 
     if has_nointer && has_hidden {
         cmd_score = cmd_score.saturating_add(1);
-        log::info!("🟡 [PSScore +1] -NonInteractive + -WindowStyle Hidden combo");
     }
     if has_encoded {
         flags.push("-EncodedCommand".to_string());
         cmd_score = cmd_score.saturating_add(2);
-        log::warn!("🟠 [PSScore +2] -EncodedCommand (base64 payload)");
     }
     if has_bypass && has_hidden && has_noprof {
         cmd_score = cmd_score.saturating_add(2);
-        log::warn!("🟠 [PSScore +2] Evasion trifecta: Bypass + Hidden + NoProfile");
     }
     if has_bypass && has_hidden && has_file {
         cmd_score = cmd_score.saturating_add(1);
-        log::warn!("🟡 [PSScore +1] Covert file delivery: Bypass + Hidden + -File");
     }
-
     if lower_cmd.contains("iex ") || lower_cmd.contains("invoke-expression") {
         flags.push("Invoke-Expression".to_string());
         cmd_score = cmd_score.saturating_add(1);
-        log::warn!("🟡 [PSScore +1] Invoke-Expression / IEX");
     }
     if lower_cmd.contains("-join") || lower_cmd.contains("`") {
         cmd_score = cmd_score.saturating_add(1);
-        log::info!("🟡 [PSScore +1] String obfuscation (-join / backtick)");
     }
     if lower_cmd.contains("[char]") {
         cmd_score = cmd_score.saturating_add(1);
-        log::info!("🟡 [PSScore +1] [char] assembly obfuscation");
     }
-    if lower_cmd.contains("getasynckeystate") || lower_cmd.contains("keylog") {
+    if lower_cmd.contains("getasynckeystate") {
         flags.push("Keylogging API".to_string());
         cmd_score = cmd_score.saturating_add(3);
-        log::warn!("🔴 [PSScore +3] GetAsyncKeyState Win32 API");
     }
     if lower_cmd.contains("getkeystate") {
         cmd_score = cmd_score.saturating_add(3);
-        log::warn!("🔴 [PSScore +3] GetKeyState Win32 API");
     }
     if lower_cmd.contains("setwindowshookex") || lower_cmd.contains("setkeyboardhook") {
         cmd_score = cmd_score.saturating_add(3);
-        log::warn!("🔴 [PSScore +3] SetWindowsHookEx / SetKeyboardHook");
     }
     if lower_cmd.contains("dllimport") && lower_cmd.contains("user32.dll") {
         cmd_score = cmd_score.saturating_add(3);
-        log::warn!("🔴 [PSScore +3] user32.dll P/Invoke DllImport");
     }
     if lower_cmd.contains("system.runtime.interopservices") {
         cmd_score = cmd_score.saturating_add(2);
-        log::warn!("🟠 [PSScore +2] System.Runtime.InteropServices (P/Invoke)");
     }
     if lower_cmd.contains("add-type") && lower_cmd.contains("system.windows.forms") {
         cmd_score = cmd_score.saturating_add(2);
-        log::warn!("🟠 [PSScore +2] Add-Type System.Windows.Forms (key capture)");
     }
     const SPECIAL_KEYS: &[&str] = &["[backspace]","[enter]","[tab]","[shift]","[ctrl]","[alt]"];
     let sk_count = SPECIAL_KEYS.iter().filter(|&&k| lower_cmd.contains(k)).count();
     if sk_count >= 2 {
         cmd_score = cmd_score.saturating_add(2);
-        log::warn!("🟠 [PSScore +2] {} special-key logging tokens", sk_count);
     }
     if lower_cmd.contains("currentversion\\run") || lower_cmd.contains("currentversion/run") {
         cmd_score = cmd_score.saturating_add(2);
-        log::warn!("🟠 [PSScore +2] Registry Run-key persistence");
     }
     if (lower_cmd.contains("while ($true)") || lower_cmd.contains("while (1)"))
         && lower_cmd.contains("start-sleep")
     {
         cmd_score = cmd_score.saturating_add(2);
-        log::warn!("🟠 [PSScore +2] Infinite polling loop (while + Start-Sleep)");
     }
     if lower_cmd.contains("$env:appdata") && lower_cmd.contains(".txt") {
         cmd_score = cmd_score.saturating_add(1);
-        log::info!("🟡 [PSScore +1] AppData .txt log-file reference");
     }
     if lower_cmd.contains("downloadstring") || lower_cmd.contains("downloadfile") {
         flags.push("Web Client Download".to_string());
         cmd_score = cmd_score.saturating_add(1);
-        log::warn!("🟡 [PSScore +1] Download-cradle (WebClient / DownloadString)");
     }
     if lower_cmd.contains("frombase64string") {
         cmd_score = cmd_score.saturating_add(2);
-        log::warn!("🟠 [PSScore +2] [Convert]::FromBase64String");
     }
-
     if lower_cmd.contains("frombase64string") ||
        lower_cmd.contains("[convert]::") ||
        (lower_cmd.contains("-f ") && lower_cmd.contains("{0}")) {

@@ -194,15 +194,9 @@ pub fn run_network_monitor(
                 _                         => "Unknown",
             };
 
-            if !should_log_connection(pid, &process_name, &saddr, sport, &daddr, dport, direction, network_type, is_browser) {
-                return;
-            }
-
             if network_type == "Loopback" && !is_browser && !is_suspicious_loopback(&process_name, sport, dport) {
                 return;
             }
-
-            log_network_event(&process_name, pid, direction, network_type, protocol, &saddr, sport, &daddr, dport, is_browser);
 
             if network_type != "External"
                 && !is_browser
@@ -286,95 +280,6 @@ pub fn run_network_monitor(
     }
 }
 
-fn log_network_event(
-    process_name: &str,
-    pid: u32,
-    direction: &str,
-    network_type: &str,
-    protocol: &str,
-    saddr: &str,
-    sport: u16,
-    daddr: &str,
-    dport: u16,
-    is_browser: bool,
-) {
-    let browser_tag = if is_browser { " [BROWSER]" } else { "" };
-    let protocol_label = if protocol == "UDP" { identify_udp_service(dport) } else { "IPv4" };
-
-    log::info!(
-        "\n\
-        ┌─ {}/IP Event{} ────────────────────────────────\n\
-        │ Process      = {}\n\
-        │ PID          = {}\n\
-        │ Direction    = {}\n\
-        │ Network Type = {}\n\
-        │ Protocol     = {}\n\
-        │ Source       = {}:{}\n\
-        │ Destination  = {}:{}\n\
-        └───────────────────────────────────────────────",
-        protocol, browser_tag,
-        process_name, pid, direction, network_type, protocol_label,
-        saddr, sport, daddr, dport
-    );
-}
-
-fn should_log_connection(
-    pid: u32,
-    process_name: &str,
-    saddr: &str,
-    sport: u16,
-    daddr: &str,
-    dport: u16,
-    direction: &str,
-    network_type: &str,
-    is_browser: bool,
-) -> bool {
-    // Never log browser loopback (pure IPC)
-    if is_browser && network_type == "Loopback" {
-        return false;
-    }
-
-    // Always forward external Connect/Disconnect/Reconnect events without dedup
-    if network_type == "External" {
-        match direction {
-            "TCP Connect" | "TCP Disconnect" | "TCP Reconnect" => return true,
-            _ => {}
-        }
-    }
-
-    // Deduplicate Send/Recv and non-external events by connection signature
-    let sig = format!("{}:{}:{}", pid, daddr, dport);
-    if let Ok(mut recent) = RECENT_CONNECTIONS.lock() {
-        if recent.contains(&sig) {
-            return false;
-        }
-        recent.insert(sig);
-        if recent.len() > 5000 {
-            recent.clear();
-        }
-    }
-
-    // For browsers on non-external networks, rate-limit by tracking unique destinations
-    if is_browser && network_type != "External" {
-        if let Ok(mut tracker) = CONNECTION_TRACKER.lock() {
-            let attempts = tracker.entry(pid).or_insert_with(Vec::new);
-            let is_new = attempts.len() < 15
-                || !attempts.iter().any(|a| a.dest_addr == daddr && a.dest_port == dport);
-            if is_new {
-                attempts.push(ConnectionAttempt {
-                    timestamp: get_timestamp(),
-                    dest_addr: daddr.to_string(),
-                    dest_port: dport,
-                });
-                return true;
-            }
-            return false;
-        }
-    }
-
-    true
-}
-
 fn is_suspicious_loopback(process_name: &str, sport: u16, dport: u16) -> bool {
     const SUSPICIOUS_PROCESSES: &[&str] = &[
         "powershell.exe", "cmd.exe", "wscript.exe", "cscript.exe",
@@ -420,15 +325,6 @@ fn handle_udp_event(
                 dns_cache.clear();
             }
         }
-        log::info!(
-            "\n\
-            ┌─ DNS Event ─────────────────────────────\n\
-            │ Process Name = {}\n\
-            │ PID          = {}\n\
-            │ Destination  = {}\n\
-            └───────────────────────────────────────────────",
-            process_name, pid, daddr
-        );
         return;
     }
 
@@ -439,18 +335,6 @@ fn handle_udp_event(
         if let Ok(mut dns_cache) = DNS_CACHE.lock() {
             if !dns_cache.contains(&sig) {
                 dns_cache.insert(sig);
-                log::info!(
-                    "\n\
-                    ┌─ Multicast Event ─────────────────────────────\n\
-                    │ Process Name = {}\n\
-                    │ PID          = {}\n\
-                    │ Protocol     = {}\n\
-                    │ Destination  = {}:{}\n\
-                    └───────────────────────────────────────────────",
-                    process_name, pid,
-                    if dport == 1900 { "SSDP" } else if dport == 5353 { "mDNS" } else { "Multicast" },
-                    daddr, dport
-                );
             }
         }
         return;
@@ -471,16 +355,6 @@ fn handle_udp_event(
         }
 
         if should_log {
-            log::info!(
-                "\n\
-                ┌─ QUIC/HTTP3 Event ─────────────────────────────\n\
-                │ Process Name = {}\n\
-                │ PID          = {}\n\
-                │ Destination  = {}:{}\n\
-                │ IP Owner     = {}\n\
-                └───────────────────────────────────────────────",
-                process_name, pid, daddr, dport, identify_ip_owner(daddr)
-            );
 
             let net_direction = if event_id == EVENT_ID_UDP_SEND {
                 crate::events::network::NetworkDirection::Outbound
@@ -501,23 +375,6 @@ fn handle_udp_event(
             }
         }
         return;
-    }
-
-    // All other external UDP
-    if network_type == "External" {
-        log::info!(
-            "\n\
-            ┌─ UDP Event ─────────────────────────────\n\
-            │ Process Name = {}\n\
-            │ PID          = {}\n\
-            │ Direction    = {}\n\
-            │ Destination  = {}:{}\n\
-            │ Network Type = {}\n\
-            └───────────────────────────────────────────────",
-            process_name, pid,
-            if event_id == EVENT_ID_UDP_SEND { "Send" } else { "Recv" },
-            daddr, dport, network_type
-        );
     }
 }
 
@@ -603,43 +460,4 @@ fn format_ipv6(bytes: &[u8; 16]) -> String {
         .map(|pair| format!("{:02x}{:02x}", pair[0], pair[1]))
         .collect::<Vec<_>>()
         .join(":")
-}
-
-fn identify_ip_owner(ip: &str) -> &'static str {
-    if ip.starts_with("142.250.") || ip.starts_with("172.217.") ||
-       ip.starts_with("216.58.") || ip.starts_with("130.211.") {
-        return "[Google/YouTube]";
-    }
-    if ip.starts_with("104.16.") || ip.starts_with("104.17.") ||
-       ip.starts_with("172.64.") || ip.starts_with("104.18.") {
-        return "[Cloudflare CDN]";
-    }
-    if ip.starts_with("54.") || ip.starts_with("52.") || ip.starts_with("18.") {
-        return "[Amazon AWS]";
-    }
-    if ip.starts_with("13.") || ip.starts_with("20.") ||
-       ip.starts_with("40.") || ip.starts_with("104.") {
-        return "[Microsoft]";
-    }
-    if ip.starts_with("23.") || ip.starts_with("184.") {
-        return "[Akamai CDN]";
-    }
-    if ip.starts_with("157.240.") || ip.starts_with("31.13.") {
-        return "[Facebook/Meta]";
-    }
-    ""
-}
-
-fn identify_udp_service(port: u16) -> &'static str {
-    match port {
-        53   => "DNS",
-        123  => "NTP",
-        161 | 162 => "SNMP",
-        443  => "QUIC (HTTP/3)",
-        500  => "IKE/IPSec",
-        1900 => "SSDP",
-        3478 => "STUN",
-        5353 => "mDNS",
-        _    => "UDP",
-    }
 }

@@ -4,7 +4,7 @@ use crossbeam_channel::Sender;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use crate::utils::common::{
-    get_process_name_cached, cache_process_start, is_common_short_lived_process,
+    get_process_name_cached, cache_process_start,
     is_system_process, cleanup_tracking_data, GLOBAL_SENDER,
 };
 use windows::Win32::System::Diagnostics::Etw::*;
@@ -134,12 +134,6 @@ pub fn run_process_monitor(
                         None,
                     );
 
-                    log_process_event(
-                        &process_name,
-                        pid,
-                        "Process Started",
-                    );
-
                     let event = ProcessEvent::new_start(
                         pid,
                         parent_pid,
@@ -150,14 +144,6 @@ pub fn run_process_monitor(
                 }
 
                 2 => {
-                    if !is_common_short_lived_process(&process_name) {
-                        log_process_event(
-                            &process_name,
-                            pid,
-                            "Process Ended",
-                        );
-                    }
-
                     let event = ProcessEvent::new_end(pid, process_name.clone(), None);
                     BaseEvent::new(EventType::ProcessEnd(event))
                 }

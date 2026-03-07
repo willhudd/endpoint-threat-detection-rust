@@ -161,10 +161,6 @@ fn process_event(
                 if let Some(service) = identify_webhook_service_by_domain(domain) {
                     let resolved_ip = &network_event.remote_address;
                     if !resolved_ip.is_empty() && resolved_ip != "0.0.0.0" {
-                        log::info!(
-                            "🌐 [DNS cache] Recorded webhook DNS: {} → {} ({}) queried by PID {}",
-                            domain, resolved_ip, service, network_event.pid
-                        );
                         alert_state.dns_webhook_observations.insert(
                             resolved_ip.clone(),
                             (service, chrono::Utc::now(), network_event.pid),
@@ -222,36 +218,10 @@ fn handle_process_start(
 
     let context = process_contexts.get_mut(&pid).unwrap();
 
-    // Score each suspicious command-line flag
+    // For each suspicious command-line flag found, add 1 to the suspicion score
     for flag in &cmd_analysis.flags {
         context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG;
         context.alert_reasons.push(format!("Suspicious flag: {}", flag));
-        log::info!(
-            "🟡 [process_start +{}] Flag '{}' for '{}' (PID: {}) → score {}",
-            WEIGHT_SUSPICIOUS_FLAG, flag, process_name, pid, context.suspicion_score
-        );
-    }
-
-    // Apply behavioural score
-    if cmd_analysis.cmd_score >= 3 {
-        let added = WEIGHT_KEYLOGGER_API * 2;
-        context.suspicion_score += added;
-        context.alert_reasons.push(format!(
-            "Keylogging / stager API indicators (score {}/5)", cmd_analysis.cmd_score
-        ));
-        log::warn!(
-            "🔑 [process_start +{}] High-confidence PS indicators for '{}' (PID: {})",
-            added, process_name, pid
-        );
-    } else if cmd_analysis.cmd_score >= 1 {
-        context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG;
-        context.alert_reasons.push(format!(
-            "Suspicious PowerShell invocation flags (score {}/5)", cmd_analysis.cmd_score
-        ));
-        log::info!(
-            "🟡 [process_start +{}] Low-confidence PS flags for '{}' (PID: {})",
-            WEIGHT_SUSPICIOUS_FLAG, process_name, pid
-        );
     }
 
     // Check for LOLBAS abuse patterns
@@ -266,7 +236,7 @@ fn handle_process_start(
         for (reason, weight) in script_hits {
             if weight > 0 {
                 context.suspicion_score += weight;
-    }
+            }
             context.alert_reasons.push(reason);
         }
     }
@@ -323,7 +293,6 @@ fn handle_process_end(
             .filter(|(pid, ctx)| {
                 **pid != exiting_pid
                     && ctx.is_scripting_engine
-                    && !ctx.alerted
                     && exit_time - ctx.start_time <= chrono::Duration::seconds(3)
             })
             .map(|(pid, _)| *pid)
@@ -345,11 +314,11 @@ fn handle_process_end(
 
                 if !already_scored_spawn {
                     child_ctx.suspicion_score += WEIGHT_SUSPICIOUS_SHORT_LIVED_PROCESS;
-                child_ctx.alert_reasons.push(format!(
-                    "Spawned by short-lived process '{}' (PID: {}, lived {}ms) \
-                     — spawn-and-exit evasion pattern",
-                    parent_name, exiting_pid, lifetime_ms
-                ));
+                    child_ctx.alert_reasons.push(format!(
+                        "Spawned by short-lived process '{}' (PID: {}, lived {}ms) \
+                        — spawn-and-exit evasion pattern",
+                        parent_name, exiting_pid, lifetime_ms
+                    ));
                 }
 
                 // If the child's parent fields are still 0/empty (ETW race),
@@ -360,23 +329,6 @@ fn handle_process_end(
                 if child_ctx.parent_name.is_empty() || child_ctx.parent_name == "Unknown" {
                     child_ctx.parent_name = parent_name.clone();
                 }
-
-                if has_hidden && has_bypass {
-                    child_ctx.suspicion_score += WEIGHT_LOLBAS;
-                    child_ctx.alert_reasons.push(
-                        "Child carries -WindowStyle Hidden + -ExecutionPolicy Bypass \
-                         (spawn-and-exit evasion)"
-                            .to_string(),
-                    );
-                    log::warn!(
-                        "🚨 SPAWN-AND-EXIT EVASION: parent '{}' (PID: {}) lived {}ms \
-                         → child '{}' (PID: {}) has Hidden+Bypass flags. Score: +{}",
-                        parent_name, exiting_pid, lifetime_ms,
-                        child_ctx.process_name, child_pid,
-                        WEIGHT_SUSPICIOUS_FLAG * 2 + WEIGHT_LOLBAS,
-                    );
-                }
-
                 maybe_alert(child_ctx, alert_tx);
             }
         }
@@ -399,41 +351,12 @@ fn handle_network_connection(
     let remote_addr = &network_event.remote_address;
     let remote_port = network_event.remote_port;
 
-    // ── Orphaned / misattributed external connection scanner ─────────────────
-    // ETW attributes TCP events to whichever thread/process it can resolve at
-    // event time.  For keylogger payloads this is often:
-    //   - A ghost PID (no process-start event, name = "Unknown")
-    //   - A non-scripting process like Discord.exe that happens to share the
-    //     network stack context (WinSock helper threads, etc.)
-    //
-    // Condition: any external TCP/443 where the *connecting process is not itself
-    // a scripting engine with evasion flags* but the destination IP matches a
-    // known webhook service — we scan for a recently-alerted scripting candidate
-    // and attribute the connection to it.
-    //
-    // We deliberately do NOT limit this to "Unknown" PIDs: as seen in practice,
-    // Discord.exe (a real named process) can appear as the ETW owner of
-    // keylogger-originated connections.
     let is_external_https = remote_port == 443
         && !is_private_or_local(remote_addr)
         && remote_addr != "0.0.0.0";
 
-    // Connecting process is not itself a scripting engine
-    let connecting_is_scripting = process_contexts
-        .get(&pid)
-        .map(|ctx| ctx.is_scripting_engine)
-        .unwrap_or(false);
-
-    if is_external_https && !connecting_is_scripting {
+    if is_external_https {
         if let Some(service) = identify_webhook_service_by_ip(remote_addr) {
-            log::info!(
-                "🔎 [Orphan] External TCP/443 from non-scripting PID {} ('{}') → {} ({}) \
-                 — scanning for scripting candidate to attribute to",
-                pid, process_name, remote_addr, service
-            );
-
-            // Find the most recently alerted scripting context that hasn't
-            // received a webhook escalation yet, alerted within the last 90 s.
             let now = chrono::Utc::now();
 
             // ── Step 1: Does a viable scripting candidate exist? ─────────────
@@ -516,55 +439,34 @@ fn handle_network_connection(
                     .unwrap_or(false);
 
                 if is_tree_related && !connecting_is_scripting {
-                let attributed_conn = NetworkConnection {
-                    timestamp: chrono::Utc::now(),
-                    protocol: "TCP".to_string(),
-                    remote_addr: remote_addr.to_string(),
-                    remote_port,
-                    remote_domain: network_event.domain.clone(),
-                    is_external: true,
-                    data_size: network_event.data_size,
-                };
+                    let attributed_conn = NetworkConnection {
+                        timestamp: now,
+                        protocol: "TCP".to_string(),
+                        remote_addr: remote_addr.to_string(),
+                        remote_port,
+                        remote_domain: network_event.domain.clone(),
+                        is_external: true,
+                        data_size: network_event.data_size,
+                    };
 
-                log::warn!(
-                    "🔗 [Orphan] Attributing {}:{} ({}) to '{}' (PID: {}) \
-                     — actual ETW owner was PID {} ('{}')",
-                    remote_addr, remote_port, service,
-                    process_contexts.get(&cpid).map(|c| c.process_name.as_str()).unwrap_or("?"),
-                    cpid, pid, process_name
-                );
+                    if let Some(ctx) = process_contexts.get_mut(&cpid) {
+                        ctx.network_connections.push(attributed_conn);
 
-                if let Some(ctx) = process_contexts.get_mut(&cpid) {
-                    // Always record the connection so network count stays accurate
-                    ctx.network_connections.push(attributed_conn);
-
-                    let already = ctx.alert_reasons.iter()
-                        .any(|r| r.to_lowercase().contains("webhook"));
-                    if !already {
-                        ctx.suspicion_score += WEIGHT_WEBHOOK;
-                        ctx.alert_reasons.push(format!(
-                            "Webhook exfiltration confirmed (attributed from ETW owner PID {} '{}'): \
-                             {} → {} (IP: {})",
-                            pid, process_name, ctx.process_name, service, remote_addr
-                        ));
-                        log::warn!(
-                            "🚨 [Orphan +{}] Webhook confirmed for '{}' (PID: {}) \
-                             via connection attributed from PID {} → {} score→{}",
-                            WEIGHT_WEBHOOK, ctx.process_name, cpid,
-                            pid, remote_addr, ctx.suspicion_score
-                        );
-                        maybe_alert(ctx, alert_tx);
-                    } else {
-                        // Webhook already scored but keep counting connections;
-                        // re-run maybe_alert in case score crossed a new threshold
-                        maybe_alert(ctx, alert_tx);
+                        let already = ctx.alert_reasons.iter()
+                            .any(|r| r.to_lowercase().contains("webhook"));
+                        if !already {
+                            ctx.suspicion_score += WEIGHT_WEBHOOK;
+                            ctx.alert_reasons.push(format!(
+                                "Webhook exfiltration confirmed (attributed from ETW owner PID {} '{}'): \
+                                 {} → {} (IP: {})",
+                                pid, process_name, ctx.process_name, service, remote_addr
+                            ));
+                            maybe_alert(ctx, alert_tx);
+                        } else {
+                            maybe_alert(ctx, alert_tx);
+                        }
                     }
                 }
-            } else {
-                log::info!(
-                    "🔎 [Orphan] No recently-alerted scripting candidate for PID {} → {}",
-                    pid, remote_addr
-                );
             }
         }
     }
@@ -859,10 +761,6 @@ fn check_webhook_exfiltration(
         context.alert_reasons.push(
             "Webhook exfiltration URL/cmdlet present in command line".to_string(),
         );
-        log::warn!(
-            "🚨 [Webhook +{}] Inline webhook indicator for '{}' (PID: {}) score→{}",
-            WEIGHT_WEBHOOK, context.process_name, context.pid, context.suspicion_score
-        );
     }
 
     // ── Path A: Domain resolved and it is a known webhook service ────────────
@@ -874,11 +772,6 @@ fn check_webhook_exfiltration(
                     "Webhook exfiltration detected: PowerShell → {} (domain: {})",
                     service, domain
                 ));
-                log::warn!(
-                    "🚨 [Webhook +{}] Domain match '{}' → {} for '{}' (PID: {}) score→{}",
-                    WEIGHT_WEBHOOK, domain, service,
-                    context.process_name, context.pid, context.suspicion_score
-                );
             }
             return;
         }
@@ -901,12 +794,6 @@ fn check_webhook_exfiltration(
                          DNS observed {}s ago)",
                         service, remote_addr, age.num_seconds()
                     ));
-                    log::warn!(
-                        "🚨 [Webhook +{}] DNS-correlated webhook: '{}' (PID: {}) → {} at {} \
-                         (DNS seen {}s ago) score→{}",
-                        WEIGHT_WEBHOOK, context.process_name, context.pid,
-                        service, remote_addr, age.num_seconds(), context.suspicion_score
-                    );
                 }
                 return;
             }
@@ -930,11 +817,6 @@ fn check_webhook_exfiltration(
                     "Probable webhook exfiltration (IP-range heuristic): PowerShell → {} (IP: {})",
                     service, remote_addr
                 ));
-                log::warn!(
-                    "🚨 [Webhook +{}] IP-heuristic webhook: '{}' (PID: {}) → {} at {} score→{}",
-                    WEIGHT_WEBHOOK, context.process_name, context.pid,
-                    service, remote_addr, context.suspicion_score
-                );
             }
             return;
         }
@@ -955,11 +837,6 @@ fn check_webhook_exfiltration(
                     "Evasion-flagged PowerShell making external HTTPS connection ({}:{})",
                     remote_addr, remote_port
                 ));
-                log::info!(
-                    "🟡 [Webhook catch-all +{}] Evasion-PS → HTTPS {}:{} for '{}' (PID: {}) score→{}",
-                    WEIGHT_SUSPICIOUS_FLAG, remote_addr, remote_port,
-                    context.process_name, context.pid, context.suspicion_score
-                );
             }
         }
     }
@@ -973,18 +850,15 @@ fn check_immediate_threats(
     if alert_state.known_malicious_ips.contains(&connection.remote_addr) {
         context.suspicion_score += WEIGHT_MALICIOUS_IP;
         context.alert_reasons.push(format!("Connection to known malicious IP: {}", connection.remote_addr));
-        log::warn!("⚠️ MALICIOUS IP: {} (Score: +{})", connection.remote_addr, WEIGHT_MALICIOUS_IP);
     }
 
     if let Some(domain) = &connection.remote_domain {
         if alert_state.known_malicious_domains.contains(domain) {
             context.suspicion_score += WEIGHT_SUSPICIOUS_DOMAIN;
             context.alert_reasons.push(format!("Connection to known malicious domain: {}", domain));
-            log::warn!("⚠️ MALICIOUS DOMAIN: {} (Score: +{})", domain, WEIGHT_SUSPICIOUS_DOMAIN);
         } else if is_suspicious_domain(domain) {
             context.suspicion_score += WEIGHT_SUSPICIOUS_DOMAIN;
             context.alert_reasons.push(format!("Connection to suspicious domain: {}", domain));
-            log::warn!("⚠️ SUSPICIOUS DOMAIN: {} (Score: +{})", domain, WEIGHT_SUSPICIOUS_DOMAIN);
         }
     }
 
@@ -992,8 +866,6 @@ fn check_immediate_threats(
         context.suspicion_score += WEIGHT_HIGH_RISK_PORT;
         context.alert_reasons.push(format!("Connection to high-risk port {} ({})",
             connection.remote_port, describe_port(connection.remote_port)));
-        log::warn!("⚠️ HIGH-RISK PORT: {} ({}) (Score: +{})",
-            connection.remote_port, describe_port(connection.remote_port), WEIGHT_HIGH_RISK_PORT);
     }
 
     if context.is_scripting_engine
@@ -1004,8 +876,6 @@ fn check_immediate_threats(
         context.suspicion_score += WEIGHT_WEBHOOK;
         context.alert_reasons.push(format!("Large data exfiltration ({} bytes) to external host",
             connection.data_size.unwrap_or(0)));
-        log::warn!("⚠️ LARGE DATA EXFIL: {} bytes (Score: +{})",
-            connection.data_size.unwrap_or(0), WEIGHT_WEBHOOK);
     }
 }
 
@@ -1055,8 +925,6 @@ fn evaluate_network_alert(
             if !is_normal {
                 context.suspicion_score += WEIGHT_RAPID_CONNECTIONS;
                 context.alert_reasons.push(format!("Rapid connections: {} in 10 seconds", connections_last_10s));
-                log::warn!("⚡ RAPID CONNECTIONS: {} in 10s by {} (Score: +{})",
-                    connections_last_10s, context.process_name, WEIGHT_RAPID_CONNECTIONS);
             }
         }
     }
@@ -1085,8 +953,6 @@ fn evaluate_network_alert(
                 "Immediate external connection after start (age: {}s, risk factors: {})",
                 process_age.num_seconds(), immediate_risk_score
             ));
-            log::warn!("🚨 IMMEDIATE HIGH-RISK CONNECTION: {}:{} (Risk factors: {}) (Score: +{})",
-                connection.remote_addr, connection.remote_port, immediate_risk_score, WEIGHT_IMMEDIATE_C2);
         }
     }
 
@@ -1095,8 +961,6 @@ fn evaluate_network_alert(
         if context.is_scripting_engine {
             context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG;
             context.alert_reasons.push("Scripting engine using QUIC/HTTP3 protocol".to_string());
-            log::warn!("🌐 SCRIPT USING QUIC: {} (Score: +{})",
-                context.process_name, WEIGHT_SUSPICIOUS_FLAG);
         } else if !is_network_aware_process(&context.process_name) {
             context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG;
             context.alert_reasons.push("Non-network process using QUIC protocol".to_string());
@@ -1108,18 +972,10 @@ fn evaluate_network_alert(
     if context.suspicious_flags.is_empty() && context.is_scripting_engine {
         let new_flags = analyze_command_line(&context.command_line).flags;
         if !new_flags.is_empty() {
-            log::info!(
-                "🔍 [Rule5] Late command-line analysis found {} new flags for '{}' (PID: {}): {:?}",
-                new_flags.len(), context.process_name, context.pid, new_flags
-            );
             context.suspicious_flags = new_flags.clone();
             for flag in &new_flags {
                 context.suspicion_score += WEIGHT_SUSPICIOUS_FLAG;
                 context.alert_reasons.push(format!("Suspicious flag (late-detected): {}", flag));
-                log::warn!(
-                    "🟡 [Rule5 +{}] Late-detected flag '{}' for '{}' (PID: {})",
-                    WEIGHT_SUSPICIOUS_FLAG, flag, context.process_name, context.pid
-                );
             }
         }
     }
@@ -1136,7 +992,6 @@ fn evaluate_network_alert(
             if !is_known_good_process(&context.process_name, &context.command_line) {
                 context.suspicion_score += WEIGHT_RAPID_CONNECTIONS;
                 context.alert_reasons.push(format!("Beaconing pattern: {} connections to same target", same_target_count));
-                log::warn!("📡 BEACONING PATTERN: {} connections to {}", same_target_count, first_remote);
             }
         }
     }
@@ -1247,11 +1102,6 @@ fn check_temporal_correlations(
                     "Scripting engine with Hidden+Bypass flags whose parent has already exited \
                      — likely spawn-and-exit evasion (temporal correlation)"
                         .to_string(),
-                );
-                log::warn!(
-                    "🚨 TEMPORAL CORRELATION: scripting engine '{}' (PID: {}) has \
-                     Hidden+Bypass flags and orphaned parent — spawn-and-exit evasion",
-                    ctx.process_name, pid
                 );
             }
 
