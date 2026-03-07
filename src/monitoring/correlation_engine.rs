@@ -17,7 +17,9 @@ use std::time::Duration;
 // Suspicion scoring weights
 const SUSPICION_THRESHOLD: u32 = 5;               // Adjust based on your environment
 const WEIGHT_SUSPICIOUS_FLAG: u32 = 1;
+const WEIGHT_SUSPICIOUS_SHORT_LIVED_PROCESS: u32 = 2;
 const WEIGHT_KEYLOGGER_API: u32 = 2;
+const WEIGHT_KEYLOGGER_API_RUNTIME: u32 = 4;
 const WEIGHT_WEBHOOK: u32 = 3;
 const WEIGHT_MALICIOUS_IP: u32 = 5;
 const WEIGHT_SUSPICIOUS_DOMAIN: u32 = 3;
@@ -256,13 +258,18 @@ fn handle_process_start(
     if let Some(pattern) = identify_lolbas_abuse(process_name, &command_line) {
         context.suspicion_score += WEIGHT_LOLBAS;
         context.alert_reasons.push(format!("LOLBAS pattern: {}", pattern));
-        log::warn!(
-            "🟠 [process_start +{}] LOLBAS '{}' for '{}' (PID: {}) → score {}",
-            WEIGHT_LOLBAS, pattern, process_name, pid, context.suspicion_score
-        );
     }
 
-    maybe_alert(context, alert_tx);
+    // Scans the contents of a script file referenced in the command line
+    if context.is_scripting_engine && !command_line.is_empty() {
+        let script_hits = scan_script_file_for_apis(&command_line);
+        for (reason, weight) in script_hits {
+            if weight > 0 {
+                context.suspicion_score += weight;
+    }
+            context.alert_reasons.push(reason);
+        }
+    }
 }
 
 fn handle_process_end(
@@ -332,25 +339,18 @@ fn handle_process_end(
 
         for child_pid in candidate_pids {
             if let Some(child_ctx) = process_contexts.get_mut(&child_pid) {
-                let child_cmd = child_ctx.command_line.to_lowercase();
 
-                let has_hidden = child_cmd.contains("-windowstyle hidden")
-                    || child_cmd.contains("-w hidden");
-                let has_bypass = child_cmd.contains("-executionpolicy bypass")
-                    || child_cmd.contains("-ep bypass");
+                let already_scored_spawn = child_ctx.alert_reasons.iter()
+                    .any(|r| r.contains("spawn-and-exit evasion pattern"));
 
-                // Require at least one evasion flag to avoid false positives
-                // from unrelated processes that started in the same window.
-                if !has_hidden && !has_bypass {
-                    continue;
-                }
-
-                child_ctx.suspicion_score += WEIGHT_SUSPICIOUS_FLAG * 2;
+                if !already_scored_spawn {
+                    child_ctx.suspicion_score += WEIGHT_SUSPICIOUS_SHORT_LIVED_PROCESS;
                 child_ctx.alert_reasons.push(format!(
                     "Spawned by short-lived process '{}' (PID: {}, lived {}ms) \
                      — spawn-and-exit evasion pattern",
                     parent_name, exiting_pid, lifetime_ms
                 ));
+                }
 
                 // If the child's parent fields are still 0/empty (ETW race),
                 // backfill them now that we've positively identified the parent.
@@ -435,6 +435,10 @@ fn handle_network_connection(
             // Find the most recently alerted scripting context that hasn't
             // received a webhook escalation yet, alerted within the last 90 s.
             let now = chrono::Utc::now();
+
+            // ── Step 1: Does a viable scripting candidate exist? ─────────────
+            // Only proceed if there is a recently-alerted scripting engine that
+            // has not yet received a webhook escalation.
             let candidate_pid = process_contexts
                 .iter()
                 .filter(|(_, ctx)| {
@@ -449,7 +453,69 @@ fn handle_network_connection(
                 .map(|(p, _)| *p);
 
             if let Some(cpid) = candidate_pid {
-                // Build a NetworkConnection record so the count is accurate
+                let candidate_parent_pid = process_contexts
+                    .get(&cpid)
+                    .map(|ctx| ctx.parent_pid)
+                    .unwrap_or(0);
+
+                // ── Step 2: Process-tree relationship check ──────────────────
+                // The connecting PID must be related to the scripting candidate
+                let connecting_ctx = process_contexts.get(&pid);
+                let connecting_parent_pid = connecting_ctx
+                    .map(|ctx| ctx.parent_pid)
+                    .unwrap_or(0);
+
+                let is_ghost = connecting_ctx.is_none()
+                    || process_name == "Unknown"
+                    || process_name.is_empty();
+                let is_child_of_candidate  = connecting_parent_pid == cpid;
+                let is_parent_of_candidate = pid == candidate_parent_pid && pid != 0;
+
+                // Sibling: shares the same parent AND started after the scripting candidate alerted.
+                let candidate_alert_time = process_contexts
+                    .get(&cpid)
+                    .and_then(|ctx| ctx.last_alert_time)
+                    .unwrap_or(now);
+                let connecting_started_after_candidate = connecting_ctx
+                    .map(|ctx| ctx.start_time >= candidate_alert_time - chrono::Duration::seconds(5))
+                    .unwrap_or(false);
+                let is_sibling = candidate_parent_pid != 0
+                    && connecting_parent_pid == candidate_parent_pid
+                    && connecting_started_after_candidate;
+
+                // DNS ownership: if we have a DNS observation for this IP, it must
+                // have been resolved by a process in the candidate's tree.
+                let dns_obs = alert_state.dns_webhook_observations.get(remote_addr);
+                let dns_owned_by_candidate = dns_obs
+                    .map(|(_, _, resolver_pid)| {
+                        let r = *resolver_pid;
+                        r == cpid
+                            || r == pid
+                            || (candidate_parent_pid != 0 && r == candidate_parent_pid)
+                            || process_contexts.get(&r)
+                                .map(|ctx| ctx.parent_pid == candidate_parent_pid)
+                                .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+
+                // If we have a DNS observation and it's NOT owned by the candidate,
+                // reject — it's genuinely Discord or another app resolving its own domain.
+                let dns_contradicts = dns_obs.is_some() && !dns_owned_by_candidate;
+
+                let is_tree_related = !dns_contradicts
+                    && (is_ghost
+                        || is_child_of_candidate
+                        || is_parent_of_candidate
+                        || is_sibling);
+
+                // ── Step 3: Connecting process must not itself be a scripting engine
+                // If the connecting process IS a scripting engine, it should be
+                // handled by its own context's scoring, not attributed elsewhere.
+                let connecting_is_scripting = connecting_ctx
+                    .map(|ctx| ctx.is_scripting_engine)
+                    .unwrap_or(false);
+
+                if is_tree_related && !connecting_is_scripting {
                 let attributed_conn = NetworkConnection {
                     timestamp: chrono::Utc::now(),
                     protocol: "TCP".to_string(),
@@ -586,6 +652,104 @@ fn handle_network_connection(
 
     // Mark as evaluated to prevent repeated processing
     alert_state.evaluated_processes.insert(pid);
+}
+
+// Scans the contents of a script file referenced in the command line
+fn scan_script_file_for_apis(command_line: &str) -> Vec<(String, u32)> {
+    let mut hits: Vec<(String, u32)> = Vec::new();
+
+    let lower_cmd = command_line.to_lowercase();
+    let file_arg_pos = lower_cmd.find(" -file ").or_else(|| lower_cmd.find(" -f "));
+    let script_path = file_arg_pos.and_then(|pos| {
+        // Skip past " -file " or " -f "
+        let after = command_line[pos..].splitn(3, ' ').nth(2)?;
+        let path = after.trim();
+        // Strip surrounding quotes if present
+        let path = if path.starts_with('"') {
+            path.trim_matches('"')
+        } else {
+            // Take up to the next space (unquoted path)
+            path.split_whitespace().next().unwrap_or(path)
+        };
+        Some(path.to_string())
+    });
+
+    let path = match script_path {
+        Some(p) if !p.is_empty() => p,
+        _ => return hits,
+    };
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return hits,
+    };
+
+    let lower = content.to_lowercase();
+
+    const KEYLOG_APIS: &[(&str, &str)] = &[
+        ("getasynckeystate",    "GetAsyncKeyState (keylogging API) found in script"),
+        ("getkeystate",         "GetKeyState (keylogging API) found in script"),
+        ("setwindowshookex",    "SetWindowsHookEx (keyboard hook) found in script"),
+        ("setkeyboardhook",     "SetKeyboardHook found in script"),
+    ];
+
+    let mut keylog_hit = false;
+    for (api, reason) in KEYLOG_APIS {
+        if lower.contains(api) {
+            if !keylog_hit {
+                // Only score once for keylogging APIs but collect all matching reasons
+                hits.push((reason.to_string(), WEIGHT_KEYLOGGER_API_RUNTIME));
+                keylog_hit = true;
+            } else {
+                // Additional APIs found — add reason with no extra weight
+                hits.push((reason.to_string(), 0));
+            }
+        }
+    }
+
+    const CRED_APIS: &[(&str, &str)] = &[
+        ("dllimport",                       "DllImport (P/Invoke) found in script"),
+        ("user32.dll",                      "User32.dll interop found in script"),
+        ("system.runtime.interopservices",  "System.Runtime.InteropServices found in script"),
+        ("add-type",                        "Add-Type (dynamic code compilation) found in script"),
+    ];
+
+    // Only score the combination of Add-Type + DllImport + user32 as a unit avoids false positives
+    let has_addtype  = lower.contains("add-type");
+    let has_dllimport = lower.contains("dllimport");
+    let has_user32   = lower.contains("user32.dll");
+
+    if has_addtype && has_dllimport && has_user32 {
+        hits.push((
+            "Script uses Add-Type + DllImport + User32.dll (P/Invoke keylogger pattern)".to_string(),
+            WEIGHT_KEYLOGGER_API,
+        ));
+    } else {
+        // Score individual hits only if they appear without the full combination
+        for (api, reason) in CRED_APIS {
+            if lower.contains(api) {
+                hits.push((reason.to_string(), 0)); // informational only, no score
+            }
+        }
+    }
+
+    if lower.contains("currentversion\\run") || lower.contains("currentversion/run") {
+        hits.push((
+            "Registry Run key persistence found in script".to_string(),
+            WEIGHT_SUSPICIOUS_FLAG,
+        ));
+    }
+
+    if (lower.contains("while ($true)") || lower.contains("while (1)"))
+        && lower.contains("start-sleep")
+    {
+        hits.push((
+            "Persistent loop with sleep (beaconing/keylogger loop) found in script".to_string(),
+            WEIGHT_SUSPICIOUS_FLAG,
+        ));
+    }
+
+    hits
 }
 
 fn identify_webhook_service_by_domain(domain: &str) -> Option<&'static str> {
@@ -987,6 +1151,23 @@ fn check_temporal_correlations(
     alert_tx: &Sender<Alert>,
 ) {
     let now = chrono::Utc::now();
+
+    // Fallback: alert any process that scored above threshold at process-start
+    // but never received a ProcessEnd event to trigger maybe_alert.
+    let unalerted_pids: Vec<u32> = process_contexts
+        .iter()
+        .filter(|(_, ctx)| {
+            !ctx.alerted
+                && ctx.suspicion_score >= SUSPICION_THRESHOLD
+                && now - ctx.start_time > chrono::Duration::milliseconds(200)
+        })
+        .map(|(pid, _)| *pid)
+        .collect();
+    for pid in unalerted_pids {
+        if let Some(ctx) = process_contexts.get_mut(&pid) {
+            maybe_alert(ctx, alert_tx);
+        }
+    }
 
     // ── Check 1: multiple scripting processes in a short window ─────────────
     let recent_starts: Vec<_> = alert_state.process_start_times
