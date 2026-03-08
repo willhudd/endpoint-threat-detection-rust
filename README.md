@@ -2,6 +2,8 @@
   <img src="assets/banner.png" alt="HIDS System Banner" width="100%">
 </p>
 
+https://github.com/user-attachments/assets/7b410bf6-ec0f-4560-a60f-02d5f6132543
+
 # Lightweight Endpoint Detection System - Rust
 
 ## 📌 Project Purpose
